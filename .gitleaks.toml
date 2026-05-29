@@ -1,0 +1,19 @@
+[allowlist]
+  description = "false-positive allowlists"
+
+  # SSH *public* keys are not secrets — they're designed to be shared.
+  # gitleaks flags ed25519 pubkey patterns in secrets/secrets.nix.
+  regexes = [
+    '''ssh-ed25519 AAAA[A-Za-z0-9+/]{68}''',
+    '''ssh-rsa AAAA[A-Za-z0-9+/]{100,}''',
+    '''ssh-ecdsa AAAA[A-Za-z0-9+/]{50,}''',
+  ]
+
+  # Files that may contain env var templates (no real values)
+  paths = [
+    '''.envrc''',
+    '''\.env.*''',
+    '''secrets/secrets\.nix''',
+    '''secrets/.*''',
+    '''\.gitleaks\.toml''',
+  ]

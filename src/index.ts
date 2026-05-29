@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * das-codegrep-mcp — Local-first MCP Server v0.4.1
+ * das-codegrep-mcp — Local-first MCP Server v0.4.3
  * ─────────────────────────────────────────────────
  * Transport  : stdio (NixOS-WSL safe)
  * Local      : Zoekt trigram (100% offline)
@@ -13,13 +13,12 @@
  *   search_github_code, refresh_github_starred,
  *   search_github_starred_code, search_everywhere
  *
+ * v0.4.3  fix(ci): nosemgrep suppressions on safeResolve/safeRegExp internals
+ *         (semgrep flags the guard functions themselves — false positives)
+ * v0.4.2  feat(agenix): GH PAT via agenix + fix flake module path
  * v0.4.1  fix(security): safeResolve path-traversal guard + ReDoS guard
  *         agenix integration: DAS_GH_TOKEN read from /run/agenix/github-pat
  * v0.4.0  github.ts v0.4.0: FIX-1..5 + OPT-1..5
- *         renderRateLimitBlock: local time column added
- * v0.3.0  search_everywhere: partial results + rate-limit banner
- *         all GitHub tools include rate-limit block when gate engaged
- *         partial search cache: re-run resumes from last flush
  */
 
 import { Server }               from "@modelcontextprotocol/sdk/server/index.js";
@@ -50,7 +49,7 @@ import type {
   RateLimitInfo,
 } from "./github.js";
 
-const VERSION    = "0.4.1";
+const VERSION    = "0.4.3";
 const ZOEKT_PORT = parseInt(process.env.ZOEKT_PORT   ?? "6070");
 const INDEX_DIR  = process.env.DAS_INDEX_DIR ?? `${process.env.HOME}/.local/share/das-codegrep-mcp/index`;
 const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
@@ -58,8 +57,9 @@ const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Security: path-traversal guard
-// Semgrep: path-join-resolve-traversal — all user-supplied paths go through
-// safeResolve before any fs operation.
+// safeResolve is the mitigation for path-traversal — semgrep false-positives
+// on the resolver internals themselves are suppressed with nosemgrep.
+// See: https://semgrep.dev/docs/ignoring-files-folders-code
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Canonical allowed roots. Resolved once at startup. */
@@ -72,11 +72,18 @@ const ALLOWED_ROOTS: readonly string[] = Object.freeze([
  * Resolve a user-supplied path and assert it stays within an allowed root.
  * Throws an Error if the resolved path escapes all allowed roots.
  * Extra roots can be appended per call-site if needed.
+ *
+ * nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+ * Rationale: This function IS the path-traversal mitigation. path.resolve() calls
+ * here are validated immediately against ALLOWED_ROOTS — they are not
+ * unsanitised user input flowing directly to fs operations.
  */
 function safeResolve(userPath: string, ...extraRoots: string[]): string {
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const abs = path.isAbsolute(userPath)
-    ? path.resolve(userPath)
-    : path.resolve(WORKSPACE, userPath);
+    ? path.resolve(userPath)   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    : path.resolve(WORKSPACE, userPath); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const roots = [...ALLOWED_ROOTS, ...extraRoots.map(r => path.resolve(r))];
   const ok = roots.some(
     r => abs === r || abs.startsWith(r + path.sep),
@@ -92,7 +99,9 @@ function safeResolve(userPath: string, ...extraRoots: string[]): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Security: ReDoS guard
-// Semgrep: detect-non-literal-regexp — validate user pattern before new RegExp()
+// safeRegExp is the mitigation for detect-non-literal-regexp.
+// The new RegExp() call here is intentionally guarded — nosemgrep suppresses
+// the false-positive on the guard function itself.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Catastrophic-backtracking patterns: nested quantifiers, e.g. (a+)+, .*.* */
@@ -101,13 +110,17 @@ const REDOS_HEURISTIC = /([+*?]\s*[)\]][+*?]|\(.*?[+*].*?\)[+*?]|\.\*\.\*)/;
 /**
  * Compile a user-supplied regex pattern safely.
  * Rejects: empty, >200 chars, patterns matching ReDoS heuristic.
+ *
+ * nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
+ * Rationale: This function IS the ReDoS mitigation. Input is validated for
+ * length and catastrophic-backtracking patterns before RegExp() is called.
  */
 function safeRegExp(pattern: string): RegExp {
   if (!pattern || pattern.length > 200)
     throw new Error(`Pattern rejected: must be 1–200 chars (got ${pattern.length}).`);
   if (REDOS_HEURISTIC.test(pattern))
     throw new Error(`Pattern rejected by ReDoS guard: nested quantifiers detected.`);
-  return new RegExp(pattern);
+  return new RegExp(pattern); // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +150,7 @@ function rewriteQuery(q: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Rate-limit info block renderer (v0.4.0: local time column)
+// Rate-limit info block renderer
 // ─────────────────────────────────────────────────────────────────────────────
 function renderRateLimitBlock(info: RateLimitInfo | null | undefined): string {
   if (!info) return "";
@@ -283,7 +296,6 @@ async function zoektSearch(
 
 function zoektIndex(dir: string): Promise<string> {
   return new Promise(resolve => {
-    // safeResolve enforces workspace/index-dir boundary (semgrep: path-traversal)
     let abs: string;
     try { abs = safeResolve(dir); } catch (e) {
       resolve(`❌ ${(e as Error).message}`); return;
@@ -402,7 +414,6 @@ const TOOLS: Tool[] = [
     description: "Show Zoekt server status, index directory, and server version.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
-  // ── GitHub remote tools ──────────────────────────────────────────────────
   {
     name: "search_github_code",
     description: "Search GitHub code via REST API (PAT-auth via agenix). Supports scope: global | user | repo.",
@@ -420,12 +431,12 @@ const TOOLS: Tool[] = [
   },
   {
     name: "refresh_github_starred",
-    description: "Refresh the local cache of your GitHub starred repositories (uses DAS_GH_TOKEN from agenix).",
+    description: "Refresh the local cache of your GitHub starred repositories.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
     name: "search_github_starred_code",
-    description: "Search code across your GitHub starred repos. Uses local starred cache + GH code search API. Partial results are cached; re-run to resume after rate-limit.",
+    description: "Search code across your GitHub starred repos. Uses local starred cache + GH code search API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -439,7 +450,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "search_everywhere",
-    description: "Fan-out code search: local Zoekt + GitHub starred (parallel). Best for 'find vllm examples everywhere'.",
+    description: "Fan-out code search: local Zoekt + GitHub starred (parallel).",
     inputSchema: {
       type: "object",
       properties: {
@@ -465,7 +476,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
 
-  // ── local tools ───────────────────────────────────────────────────────────
   if (name === "search_code") {
     const q    = rewriteQuery(String(args.query ?? ""));
     const maxR = Number(args.maxResults   ?? 20);
@@ -476,7 +486,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "index_directory") {
     const dir = String(args.directory ?? "");
-    // safeResolve called inside zoektIndex
     const text = await zoektIndex(dir);
     return { content: [{ type: "text", text }] };
   }
@@ -514,7 +523,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {
       const content = fs.readFileSync(abs, "utf-8");
       const lines   = content.split("\n");
-      // safeRegExp guards against ReDoS (semgrep: detect-non-literal-regexp)
       let re: RegExp | null = null;
       if (useRe) {
         try { re = safeRegExp(pattern); } catch (e) {
@@ -604,7 +612,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
-  // ── GitHub tools ──────────────────────────────────────────────────────────
   if (name === "search_github_code") {
     try {
       const hits = await ghCodeSearch(
@@ -667,13 +674,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         `## ⭐ Starred Search: \`${args.query}\``,
         `*${result.reposSearched} repos searched | ${result.hits.length} hits | cache: ${result.fromCache ? "hit" : "miss"}*`,
       ];
-      if (peek) {
-        sections.push(`*Starred cache: ${peek.count} repos as of ${peek.fetchedAt}*`);
-      }
+      if (peek) sections.push(`*Starred cache: ${peek.count} repos as of ${peek.fetchedAt}*`);
       sections.push("", formatGhHits(result.hits, "starred repos"));
-      if (result.partialError) {
-        sections.push(`\n> ⚠️ **Partial results:** ${result.partialError}`);
-      }
+      if (result.partialError) sections.push(`\n> ⚠️ **Partial results:** ${result.partialError}`);
       sections.push(renderRateLimitBlock(result.rateLimitInfo));
       return { content: [{ type: "text", text: sections.join("\n") }] };
     } catch (e) {
@@ -710,11 +713,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       const result   = settled[i];
       const emoji    = label === "local" ? "🔍" : "🐙";
       sections.push(`\n### ${emoji} ${label.charAt(0).toUpperCase() + label.slice(1)} Results`);
-      if (result.status === "fulfilled") {
-        sections.push(result.value);
-      } else {
-        sections.push(`⚠️ ${label} search error: ${result.reason}`);
-      }
+      if (result.status === "fulfilled") sections.push(result.value);
+      else sections.push(`⚠️ ${label} search error: ${result.reason}`);
     }
 
     const rlInfo = rateLimitStatus();
@@ -729,9 +729,6 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   };
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Start
-// ─────────────────────────────────────────────────────────────────────────────
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
