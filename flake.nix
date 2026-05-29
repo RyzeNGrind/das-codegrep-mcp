@@ -14,7 +14,9 @@
   };
 
   outputs =
-    inputs@{ flake-parts
+    inputs@{ self
+    , nixpkgs
+    , flake-parts
     , systems
     , agenix
     , ...
@@ -105,6 +107,35 @@
         };
 
       flake = {
+        # ── NixOS system configurations ──────────────────────────────────────
+        # Usage in your host flake:
+        #   nixosConfigurations.pc = inputs.das-codegrep-mcp.nixosConfigurations.pc;
+        # Or import the module directly (preferred):
+        #   modules = [ inputs.das-codegrep-mcp.nixosModules.das-codegrep-mcp ]
+        nixosConfigurations.pc = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          specialArgs = { inherit inputs; };
+          modules = [
+            agenix.nixosModules.default
+            (import ./nix/modules/das-codegrep-mcp.nix)
+            {
+              services.das-codegrep-mcp = {
+                enable    = true;
+                user      = "ryzengrind";
+                workspace = "/home/ryzengrind/Workspaces";
+                indexDir  = "/home/ryzengrind/.local/share/das-codegrep-mcp/index";
+                ghUser    = "RyzeNGrind";
+                githubPatAgeFile = ./secrets/github-pat.age;
+              };
+              # Minimal stubs so nixosSystem evaluates without a full hardware config
+              networking.hostName = "pc";
+              system.stateVersion = "25.05";
+              fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+              boot.loader.grub.enable = false;
+            }
+          ];
+        };
+
         # NixOS system module (agenix + systemd service + session vars)
         nixosModules.das-codegrep-mcp = import ./nix/modules/das-codegrep-mcp.nix;
 

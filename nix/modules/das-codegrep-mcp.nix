@@ -5,13 +5,15 @@
 #   inputs.agenix.url = "github:ryantm/agenix";
 #   inputs.das-codegrep-mcp.url = "github:RyzeNGrind/das-codegrep-mcp";
 #
-# In nixosConfigurations.<host>.modules:
+# In nixosConfigurations.pc.modules:
 #   inputs.agenix.nixosModules.default
 #   inputs.das-codegrep-mcp.nixosModules.das-codegrep-mcp
 #
 # Encrypted secret (create once):
-#   cd ~/flake && agenix -e secrets/github-pat.age
+#   cd ~/Workspaces/das-codegrep-mcp
+#   RULES=$(pwd)/secrets/secrets.nix agenix -e github-pat.age -i ~/.ssh/id_ed25519
 #   # paste raw PAT: ghp_xxxxxxxxxxxxxxxx  (single line, no KEY= prefix)
+#   mv github-pat.age secrets/github-pat.age
 #
 # secrets/secrets.nix must list your host's ed25519 public key:
 #   { "github-pat.age".publicKeys = [ "ssh-ed25519 AAAA..." ]; }
