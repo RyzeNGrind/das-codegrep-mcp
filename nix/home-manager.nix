@@ -1,9 +1,8 @@
 # nix/home-manager.nix — Home Manager user service module (NixOS-WSL safe)
-{
-  config,
-  lib,
-  pkgs,
-  ...
+{ config
+, lib
+, pkgs
+, ...
 }:
 let
   cfg = config.services.dasCodegrepMcp;

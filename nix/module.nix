@@ -1,9 +1,8 @@
 # nix/module.nix — NixOS system-wide service module
-{
-  config,
-  lib,
-  pkgs,
-  ...
+{ config
+, lib
+, pkgs
+, ...
 }:
 let
   cfg = config.services.dasCodegrepMcp;
