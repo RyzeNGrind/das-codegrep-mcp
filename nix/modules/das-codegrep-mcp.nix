@@ -1,21 +1,47 @@
-# NixOS module — das-codegrep-mcp with agenix secret injection
+# NixOS module — das-codegrep-mcp with agenix GH PAT injection
 # ─────────────────────────────────────────────────────────────────────────────
-# Prerequisites in your flake.nix:
+# Prerequisites in your host flake.nix:
+#
 #   inputs.agenix.url = "github:ryantm/agenix";
-#   imports = [ inputs.agenix.nixosModules.default ];
+#   inputs.das-codegrep-mcp.url = "github:RyzeNGrind/das-codegrep-mcp";
 #
-# Encrypted secret file:
-#   secrets/github-pat.age   — encrypt with:
-#     agenix -e secrets/github-pat.age
-#   (contains a single line: ghp_xxxxxxxxxxxxxxxxxxxx)
+# In nixosConfigurations.<host>.modules:
+#   inputs.agenix.nixosModules.default
+#   inputs.das-codegrep-mcp.nixosModules.das-codegrep-mcp
 #
-# secrets.nix (in your secrets/ dir):
-#   { "github-pat.age".publicKeys = [ "ssh-ed25519 AAAA... host-key" ]; }
+# Encrypted secret (create once):
+#   cd ~/flake && agenix -e secrets/github-pat.age
+#   # paste raw PAT: ghp_xxxxxxxxxxxxxxxx  (single line, no KEY= prefix)
+#
+# secrets/secrets.nix must list your host's ed25519 public key:
+#   { "github-pat.age".publicKeys = [ "ssh-ed25519 AAAA..." ]; }
 # ─────────────────────────────────────────────────────────────────────────────
 { config, lib, pkgs, ... }:
 
 let
   cfg = config.services.das-codegrep-mcp;
+
+  # Script that converts the raw agenix secret (plain PAT value) into
+  # a KEY=value env file that systemd EnvironmentFile= can consume.
+  # Written to /run/das-codegrep-mcp/github-pat.env (tmpfs, no disk trace).
+  patEnvGen = pkgs.writeShellScript "das-codegrep-pat-env-gen" ''
+    set -euo pipefail
+    SECRET_FILE="/run/agenix/github-pat"
+    ENV_FILE="/run/das-codegrep-mcp/github-pat.env"
+
+    install -d -m 0700 -o ${cfg.user} /run/das-codegrep-mcp
+
+    if [ -r "$SECRET_FILE" ]; then
+      PAT="$(< "$SECRET_FILE")"
+      printf 'DAS_GH_TOKEN=%s\n' "$PAT" > "$ENV_FILE"
+      chmod 0400 "$ENV_FILE"
+      chown ${cfg.user} "$ENV_FILE"
+      echo "[das-codegrep] PAT env file written to $ENV_FILE"
+    else
+      echo "[das-codegrep] WARN: $SECRET_FILE not readable — GitHub search disabled"
+      printf 'DAS_GH_TOKEN=\n' > "$ENV_FILE"
+    fi
+  '';
 in
 {
   options.services.das-codegrep-mcp = {
@@ -24,7 +50,7 @@ in
     user = lib.mkOption {
       type    = lib.types.str;
       default = "ryzengrind";
-      description = "User to run the MCP server as.";
+      description = "Linux user to run the MCP server as.";
     };
 
     workspace = lib.mkOption {
@@ -48,81 +74,99 @@ in
     ghUser = lib.mkOption {
       type    = lib.types.str;
       default = "RyzeNGrind";
-      description = "GitHub username for starred-repo cache.";
+      description = "GitHub username for starred-repo cache and API calls.";
     };
 
-    # Path to the agenix-decrypted secret file at runtime.
-    # Default matches ryantm/agenix convention: /run/agenix/<name>
-    githubPatSecretPath = lib.mkOption {
+    # Path to the .age file, relative to the flake root.
+    # Override if your secrets dir is named differently.
+    githubPatAgeFile = lib.mkOption {
+      type    = lib.types.path;
+      default = ../../../secrets/github-pat.age;
+      description = "Path to the age-encrypted GitHub PAT file.";
+    };
+
+    enableSystemdService = lib.mkOption {
+      type    = lib.types.bool;
+      default = false;
+      description = "Whether to run das-codegrep-mcp as a systemd user service.";
+    };
+
+    mcpBin = lib.mkOption {
       type    = lib.types.str;
-      default = "/run/agenix/github-pat";
-      description = "Absolute path to the decrypted GitHub PAT file (agenix runtime path).";
+      default = "/home/ryzengrind/Workspaces/das-codegrep-mcp/bin/start";
+      description = "Absolute path to the MCP server start script.";
     };
   };
 
   config = lib.mkIf cfg.enable {
-    # ── agenix secret declaration ───────────────────────────────────────────
+    # ── 1. agenix secret declaration ────────────────────────────────────────
+    # agenix decrypts this at boot to /run/agenix/github-pat (tmpfs).
     age.secrets.github-pat = {
-      # Path to the encrypted .age file, relative to your flake root.
-      # Adjust if your secrets directory is named differently.
-      file  = ../../../secrets/github-pat.age;
+      file  = cfg.githubPatAgeFile;
       owner = cfg.user;
       group = "users";
-      mode  = "0400"; # owner-read only
+      mode  = "0400"; # owner-read only — no world/group read
     };
 
-    # ── Environment variables injected into the login shell ─────────────────
-    # These are set via PAM environment so every terminal/IDE session picks
-    # them up without sourcing .envrc manually.
+    # ── 2. Session-level env vars (no secret here) ───────────────────────────
+    # Available in every interactive shell, VSCodium, terminal, etc.
+    # DAS_GH_TOKEN is NOT set here — it comes from agenix at shell startup.
     environment.sessionVariables = {
-      DAS_GH_USER    = cfg.ghUser;
-      DAS_WORKSPACE  = cfg.workspace;
-      DAS_INDEX_DIR  = cfg.indexDir;
-      DAS_ZOEKT_URL  = "http://127.0.0.1:${toString cfg.zoektPort}";
-      ZOEKT_PORT     = toString cfg.zoektPort;
-      # DAS_GH_TOKEN is NOT set here as a literal — it is read from the
-      # agenix secret file at runtime in .envrc (Option A) or via the
-      # systemd service EnvironmentFile below.
+      DAS_GH_USER   = cfg.ghUser;
+      DAS_WORKSPACE = cfg.workspace;
+      DAS_INDEX_DIR = cfg.indexDir;
+      DAS_ZOEKT_URL = "http://127.0.0.1:${toString cfg.zoektPort}";
+      ZOEKT_PORT    = toString cfg.zoektPort;
     };
 
-    # ── systemd user service (optional — runs MCP server as a daemon) ───────
-    # Remove this block if you prefer to launch manually / via VSCodium.
-    systemd.user.services.das-codegrep-mcp = {
-      description = "das-codegrep-mcp local-first MCP server";
-      wantedBy    = [ "default.target" ];
-      after       = [ "network.target" ];
+    # ── 3. PAM snippet: load PAT from agenix into interactive sessions ───────
+    # Adds a single export to /etc/profile.d so all shells pick up the token.
+    environment.etc."profile.d/das-codegrep-mcp-pat.sh" = {
+      text = ''
+        # das-codegrep-mcp: load GH PAT from agenix secret into shell session
+        if [ -r /run/agenix/github-pat ]; then
+          export DAS_GH_TOKEN="$(< /run/agenix/github-pat)"
+        fi
+      '';
+      mode = "0444";
+    };
 
-      serviceConfig = {
-        Type             = "simple";
-        ExecStart        = "/home/${cfg.user}/Workspaces/das-codegrep-mcp/bin/start";
-        Restart          = "on-failure";
-        RestartSec       = "5s";
+    # ── 4. systemd user service (opt-in) ────────────────────────────────────
+    systemd.user.services = lib.mkIf cfg.enableSystemdService {
+      das-codegrep-mcp = {
+        description = "das-codegrep-mcp local-first MCP server";
+        wantedBy    = [ "default.target" ];
+        after       = [ "network.target" ];
 
-        # Inject secret via EnvironmentFile — agenix writes a plain-text file
-        # at /run/agenix/github-pat containing the raw PAT value.
-        # We wrap it as an env file: KEY=value format.
-        EnvironmentFile  = "-${cfg.githubPatSecretPath}";
-        # The "-" prefix means "don't fail if file missing" (graceful degradation).
-        # The file must contain exactly one line: DAS_GH_TOKEN=ghp_xxx
-        # Generate it with: echo "DAS_GH_TOKEN=$(cat /run/agenix/github-pat)" > /run/agenix/github-pat-env
-        # Or use the wrapper script below.
+        serviceConfig = {
+          Type      = "simple";
+          Restart   = "on-failure";
+          RestartSec = "5s";
 
-        Environment = [
-          "DAS_GH_USER=${cfg.ghUser}"
-          "DAS_WORKSPACE=${cfg.workspace}"
-          "DAS_INDEX_DIR=${cfg.indexDir}"
-          "ZOEKT_PORT=${toString cfg.zoektPort}"
-        ];
+          # Step 1: generate KEY=value env file from raw agenix secret
+          ExecStartPre = [
+            "+${patEnvGen}"   # '+' = run as root so it can read /run/agenix
+          ];
 
-        StandardOutput = "journal";
-        StandardError  = "journal";
-        SyslogIdentifier = "das-codegrep-mcp";
+          # Step 2: start server with that env file
+          ExecStart = cfg.mcpBin;
+
+          # EnvironmentFile with KEY=value format — generated by patEnvGen above
+          EnvironmentFile = "-/run/das-codegrep-mcp/github-pat.env";
+
+          Environment = [
+            "DAS_GH_USER=${cfg.ghUser}"
+            "DAS_WORKSPACE=${cfg.workspace}"
+            "DAS_INDEX_DIR=${cfg.indexDir}"
+            "ZOEKT_PORT=${toString cfg.zoektPort}"
+            "DAS_ZOEKT_URL=http://127.0.0.1:${toString cfg.zoektPort}"
+          ];
+
+          StandardOutput    = "journal";
+          StandardError     = "journal";
+          SyslogIdentifier  = "das-codegrep-mcp";
+        };
       };
     };
-
-    # ── direnv auto-allow for workspace ─────────────────────────────────────
-    # If you use home-manager + direnv, this auto-allows the workspace .envrc
-    # so the secret path resolves on first cd.
-    # programs.direnv.enableNixDirenvIntegration = true; # in home-manager
   };
 }

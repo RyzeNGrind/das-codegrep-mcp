@@ -2,13 +2,19 @@
   description = "das-codegrep-mcp — local-first Zoekt trigram MCP server for NixOS-WSL";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url     = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    systems.url = "github:nix-systems/default-linux";
+    systems.url     = "github:nix-systems/default-linux";
+
+    # agenix — age-encrypted secrets for NixOS
+    agenix = {
+      url    = "github:ryantm/agenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    inputs@{ flake-parts, systems, ... }:
+    inputs@{ flake-parts, systems, agenix, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = import systems;
 
@@ -20,13 +26,14 @@
 
             packages = with pkgs; [
               # Node / TS runtime
-              # nodePackages.* fully removed nixos-unstable 2026-05
-              # ts-node: use npx (installed via npm devDependencies)
               nodejs_22
               typescript
 
               # Zoekt — offline trigram search
               zoekt
+
+              # agenix CLI for secret editing
+              agenix.packages.${pkgs.system}.default
 
               # Static analysis / secret scanning
               semgrep
@@ -61,9 +68,20 @@
               printf '  lefthook  %s\n' "$(which lefthook 2>/dev/null || echo MISSING)"
               printf '  sg        %s\n' "$(which sg 2>/dev/null || echo MISSING)"
               printf '  nil       %s\n' "$(which nil 2>/dev/null || echo MISSING)"
+              printf '  agenix    %s\n' "$(which agenix 2>/dev/null || echo MISSING)"
 
               export DAS_INDEX_DIR="''${DAS_INDEX_DIR:-$HOME/.local/share/das-codegrep-mcp/index}"
               mkdir -p "$DAS_INDEX_DIR"
+
+              # Load GH PAT from agenix secret if available (read-only)
+              if [ -r /run/agenix/github-pat ]; then
+                export DAS_GH_TOKEN="$(< /run/agenix/github-pat)"
+                echo "[das-codegrep] DAS_GH_TOKEN loaded from agenix secret"
+              elif [ -n "$DAS_GH_TOKEN" ]; then
+                echo "[das-codegrep] DAS_GH_TOKEN loaded from environment"
+              else
+                echo "[das-codegrep] WARN: DAS_GH_TOKEN not set — GitHub search will be disabled"
+              fi
 
               if [ ! -d "$PWD/src/node_modules" ]; then
                 echo "[das-codegrep] npm install (first run)..."
@@ -80,7 +98,10 @@
         };
 
       flake = {
-        nixosModules.das-codegrep-mcp = import ./nix/module.nix;
+        # NixOS system module (agenix + systemd service + session vars)
+        nixosModules.das-codegrep-mcp = import ./nix/modules/das-codegrep-mcp.nix;
+
+        # Home-manager module (user-level, no agenix required)
         homeManagerModules.default = import ./nix/home-manager.nix;
       };
     };
