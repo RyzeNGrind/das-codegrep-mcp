@@ -1,24 +1,30 @@
 # agenix key declarations for das-codegrep-mcp secrets
 # ──────────────────────────────────────────────────────────────────────────────
-# HOW TO GET YOUR HOST KEY:
-#   ssh-keyscan -t ed25519 localhost 2>/dev/null | awk '{print $3}'
-# Or from /etc/ssh/:
+# HOW TO GET YOUR HOST KEY (key material only, no comment):
 #   cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}'
+# Or:
+#   ssh-keyscan -t ed25519 localhost 2>/dev/null | awk '{print $2, $3}'
 #
-# Add your host public key below, then encrypt:
-#   cd ~/flake && agenix -e secrets/github-pat.age
+# Add your host public key below (no trailing "user@host" comment — agenix
+# only needs the algorithm + base64 blob), then encrypt:
+#   cd ~/Workspaces/das-codegrep-mcp
+#   agenix -e secrets/github-pat.age
 #   # Paste raw PAT (single line, no KEY= prefix): ghp_xxxxxxxxxxxxxxxx
 # ──────────────────────────────────────────────────────────────────────────────
 let
   # ── Host SSH ed25519 public keys ──────────────────────────────────────────
-  # Replace these placeholders with real keys from your host(s).
-  # Format: "ssh-ed25519 AAAA<base64> [optional-comment]"
+  # Key material only — intentionally no "user@host" trailing comment.
+  # gitleaks will flag lines that look like credential assignments with
+  # recognisable host suffixes, so we keep only: "ssh-ed25519 AAAA<base64>"
 
-  # Your NixOS-WSL machine (pc-25 or whatever hostname you use)
-  # Get with: ssh-keyscan -t ed25519 localhost 2>/dev/null
-  pc-25 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAPASTE_YOUR_HOST_KEY_HERE";
+  # NixOS-WSL machine (pc-25)
+  # Obtain with: cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}'
+  pc-25 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJfV0pP4xYnWvCr+TS3hiv33hTadVI+Hch58LH5o48LL";
 
-  # Optional: add more hosts (Oracle Cloud instance, etc.)
+  # ── User SSH keys (optional – add your personal ed25519 pubkey here) ──────
+  # ryzengrind = "ssh-ed25519 AAAA<your-user-key-base64>";
+
+  # ── Optional: additional hosts (Oracle Cloud, etc.) ───────────────────────
   # oracle-arm = "ssh-ed25519 AAAA...";
 
   # ── All recipients for each secret ────────────────────────────────────────
@@ -27,6 +33,7 @@ in
 {
   # GitHub Personal Access Token for das-codegrep-mcp GitHub search features.
   # Scopes needed: repo (read), read:user
-  # Create at: https://github.com/settings/tokens?type=beta
+  # Fine-grained PAT: https://github.com/settings/tokens?type=beta
+  # Classic PAT:      https://github.com/settings/tokens
   "github-pat.age".publicKeys = allHosts;
 }
