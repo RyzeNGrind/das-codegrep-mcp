@@ -1,0 +1,6 @@
+feat(repo): initialize das-codegrep-mcp v0.1.0
+feat(devshell): add zoekt semgrep gitleaks trufflehog ast-grep comby lefthook
+feat(mcp): add stdio MCP server with 8 tools
+feat(nix): add NixOS + Home Manager modules
+feat(hooks): add lefthook pre-commit validation gate
+docs(readme): add one-liner nix-cfg workflow and semantic release steps

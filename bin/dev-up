@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Start local Zoekt web server in background
+set -euo pipefail
+export DAS_INDEX_DIR="${DAS_INDEX_DIR:-$HOME/.local/share/das-codegrep-mcp/index}"
+mkdir -p "$DAS_INDEX_DIR"
+pkill -f 'zoekt-webserver.*das-codegrep' 2>/dev/null || true
+zoekt-webserver -index "$DAS_INDEX_DIR" -listen 127.0.0.1:${ZOEKT_PORT:-6070} >/tmp/das-codegrep-zoekt.log 2>&1 &
+disown
+printf 'zoekt-webserver started  pid=%s  port=%s\n' "$!" "${ZOEKT_PORT:-6070}"

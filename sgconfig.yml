@@ -1,0 +1,5 @@
+# ast-grep config — add rules under rules/ directory
+# https://ast-grep.github.io/reference/sgconfig.html
+ruleDirs: []
+testConfigs: []
+utilDirs: []

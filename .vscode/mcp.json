@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "das-codegrep": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/src/dist/index.js"],
+      "env": {
+        "DAS_INDEX_DIR": "${env:HOME}/.local/share/das-codegrep-mcp/index",
+        "DAS_WORKSPACE": "${workspaceFolder}",
+        "ZOEKT_PORT": "6070"
+      }
+    }
+  }
+}

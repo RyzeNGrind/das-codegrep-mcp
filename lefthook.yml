@@ -1,0 +1,17 @@
+# lefthook.yml — pre-commit gates (run inside nix develop)
+# Install: ./bin/install-hooks
+pre-commit:
+  parallel: true
+  commands:
+    nix-fmt:
+      run: nixpkgs-fmt --check flake.nix nix/*.nix
+    statix:
+      run: statix check .
+    tsc:
+      run: bash -lc 'cd src && [ -d node_modules ] || npm install --ignore-scripts --no-fund --no-audit >/dev/null 2>&1; npx tsc --noEmit'
+    semgrep:
+      run: semgrep scan --config auto --error --exclude node_modules --exclude dist .
+    gitleaks:
+      run: gitleaks dir . --no-banner
+    trufflehog:
+      run: trufflehog filesystem . --no-update --fail --only-verified
