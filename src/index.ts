@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * das-codegrep-mcp — Local-first MCP Server v0.4.3
+ * das-codegrep-mcp — Local-first MCP Server v0.4.4
  * ─────────────────────────────────────────────────
  * Transport  : stdio (NixOS-WSL safe)
  * Local      : Zoekt trigram (100% offline)
@@ -13,11 +13,11 @@
  *   search_github_code, refresh_github_starred,
  *   search_github_starred_code, search_everywhere
  *
+ * v0.4.4  fix(ci): exact-line nosemgrep + .semgrepignore belt-and-suspenders
+ *         fix(ci): formatter output in flake.nix so `nix fmt` works
  * v0.4.3  fix(ci): nosemgrep suppressions on safeResolve/safeRegExp internals
- *         (semgrep flags the guard functions themselves — false positives)
  * v0.4.2  feat(agenix): GH PAT via agenix + fix flake module path
  * v0.4.1  fix(security): safeResolve path-traversal guard + ReDoS guard
- *         agenix integration: DAS_GH_TOKEN read from /run/agenix/github-pat
  * v0.4.0  github.ts v0.4.0: FIX-1..5 + OPT-1..5
  */
 
@@ -49,7 +49,7 @@ import type {
   RateLimitInfo,
 } from "./github.js";
 
-const VERSION    = "0.4.3";
+const VERSION    = "0.4.4";
 const ZOEKT_PORT = parseInt(process.env.ZOEKT_PORT   ?? "6070");
 const INDEX_DIR  = process.env.DAS_INDEX_DIR ?? `${process.env.HOME}/.local/share/das-codegrep-mcp/index`;
 const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
@@ -57,9 +57,16 @@ const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Security: path-traversal guard
-// safeResolve is the mitigation for path-traversal — semgrep false-positives
-// on the resolver internals themselves are suppressed with nosemgrep.
-// See: https://semgrep.dev/docs/ignoring-files-folders-code
+//
+// safeResolve IS the mitigation for path-traversal attacks.
+// The path.resolve() calls inside this function are validated immediately
+// against ALLOWED_ROOTS — they are NOT unsanitised user input flowing
+// directly to fs operations.
+//
+// Semgrep rule javascript.lang.security.audit.path-traversal.
+//   path-join-resolve-traversal.path-join-resolve-traversal
+// fires on the resolver internals themselves (false-positive).
+// Suppressed via .semgrepignore AND inline nosemgrep on exact flagged lines.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Canonical allowed roots. Resolved once at startup. */
@@ -71,20 +78,12 @@ const ALLOWED_ROOTS: readonly string[] = Object.freeze([
 /**
  * Resolve a user-supplied path and assert it stays within an allowed root.
  * Throws an Error if the resolved path escapes all allowed roots.
- * Extra roots can be appended per call-site if needed.
- *
- * nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
- * Rationale: This function IS the path-traversal mitigation. path.resolve() calls
- * here are validated immediately against ALLOWED_ROOTS — they are not
- * unsanitised user input flowing directly to fs operations.
  */
 function safeResolve(userPath: string, ...extraRoots: string[]): string {
-  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const abs = path.isAbsolute(userPath)
-    ? path.resolve(userPath)   // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-    : path.resolve(WORKSPACE, userPath); // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
-  const roots = [...ALLOWED_ROOTS, ...extraRoots.map(r => path.resolve(r))];
+    ? path.resolve(userPath)                    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    : path.resolve(WORKSPACE, userPath);        // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+  const roots = [...ALLOWED_ROOTS, ...extraRoots.map(r => path.resolve(r))]; // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   const ok = roots.some(
     r => abs === r || abs.startsWith(r + path.sep),
   );
@@ -99,9 +98,14 @@ function safeResolve(userPath: string, ...extraRoots: string[]): string {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Security: ReDoS guard
-// safeRegExp is the mitigation for detect-non-literal-regexp.
-// The new RegExp() call here is intentionally guarded — nosemgrep suppresses
-// the false-positive on the guard function itself.
+//
+// safeRegExp IS the mitigation for detect-non-literal-regexp attacks.
+// Input is validated for length and catastrophic-backtracking patterns
+// BEFORE RegExp() is called — it is not unbounded user input.
+//
+// Semgrep rule javascript.lang.security.audit.detect-non-literal-regexp.
+//   detect-non-literal-regexp fires on the guarded call (false-positive).
+// Suppressed via .semgrepignore AND inline nosemgrep on exact flagged line.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Catastrophic-backtracking patterns: nested quantifiers, e.g. (a+)+, .*.* */
@@ -110,10 +114,6 @@ const REDOS_HEURISTIC = /([+*?]\s*[)\]][+*?]|\(.*?[+*].*?\)[+*?]|\.\*\.\*)/;
 /**
  * Compile a user-supplied regex pattern safely.
  * Rejects: empty, >200 chars, patterns matching ReDoS heuristic.
- *
- * nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
- * Rationale: This function IS the ReDoS mitigation. Input is validated for
- * length and catastrophic-backtracking patterns before RegExp() is called.
  */
 function safeRegExp(pattern: string): RegExp {
   if (!pattern || pattern.length > 200)

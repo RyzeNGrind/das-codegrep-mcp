@@ -1,12 +1,12 @@
 {
-  description = "das-codegrep-mcp \u2014 local-first Zoekt trigram MCP server for NixOS-WSL";
+  description = "das-codegrep-mcp — local-first Zoekt trigram MCP server for NixOS-WSL";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     systems.url = "github:nix-systems/default-linux";
 
-    # agenix \u2014 age-encrypted secrets for NixOS
+    # agenix — age-encrypted secrets for NixOS
     agenix = {
       url = "github:ryantm/agenix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -26,6 +26,9 @@
       perSystem =
         { pkgs, ... }:
         {
+          # Expose formatter so `nix fmt` works without error
+          formatter = pkgs.nixpkgs-fmt;
+
           devShells.default = pkgs.mkShell {
             name = "das-codegrep-mcp";
 
@@ -34,7 +37,7 @@
               nodejs_22
               typescript
 
-              # Zoekt \u2014 offline trigram search
+              # Zoekt — offline trigram search
               zoekt
 
               # agenix CLI for secret editing
@@ -62,9 +65,9 @@
             shellHook = ''
               chmod +x "$PWD"/bin/* 2>/dev/null || true
 
-              echo "\u2554\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2557"
-              echo "\u2551  das-codegrep-mcp devshell ready              \u2551"
-              echo "\u255a\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u255d"
+              echo "╔══════════════════════════════════════════════╗"
+              echo "║  das-codegrep-mcp devshell ready              ║"
+              echo "╚══════════════════════════════════════════════╝"
               printf '  node      %s\n' "$(node --version 2>/dev/null || echo MISSING)"
               printf '  tsc       %s\n' "$(tsc --version 2>/dev/null || echo MISSING)"
               printf '  zoekt     %s\n' "$(which zoekt-index 2>/dev/null || echo MISSING)"
@@ -85,7 +88,7 @@
               elif [ -n "$DAS_GH_TOKEN" ]; then
                 echo "[das-codegrep] DAS_GH_TOKEN loaded from environment"
               else
-                echo "[das-codegrep] WARN: DAS_GH_TOKEN not set \u2014 GitHub search disabled"
+                echo "[das-codegrep] WARN: DAS_GH_TOKEN not set — GitHub search disabled"
               fi
 
               if [ ! -d "$PWD/src/node_modules" ]; then

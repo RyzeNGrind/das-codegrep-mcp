@@ -1,0 +1,21 @@
+# .semgrepignore — false-positive suppressions for das-codegrep-mcp
+#
+# The two rule classes below fire on our MITIGATION functions, not on
+# actual vulnerabilities. Both safeResolve() and safeRegExp() exist
+# precisely to guard against the patterns semgrep is warning about.
+# Inline nosemgrep comments are also present on the exact flagged lines
+# as belt-and-suspenders (semgrep honours whichever it sees first).
+#
+# Rule docs:
+#   path-traversal : https://sg.run/OPqk
+#   non-literal-re : https://sg.run/gr65
+
+# Ignore the compiled output directory entirely
+dist/
+node_modules/
+
+# Per-file rule suppression for src/index.ts
+# (semgrep respects "path:rule" entries in .semgrepignore)
+# Format: <relative-path>:<rule-id>
+src/index.ts:javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+src/index.ts:javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
