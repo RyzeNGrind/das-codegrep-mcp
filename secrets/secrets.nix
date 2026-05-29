@@ -17,18 +17,18 @@ let
   # gitleaks will flag lines that look like credential assignments with
   # recognisable host suffixes, so we keep only: "ssh-ed25519 AAAA<base64>"
 
-  # NixOS-WSL machine (pc-25)
+  # NixOS-WSL machine (pc)
   # Obtain with: cat /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $1, $2}'
-  pc-25 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJfV0pP4xYnWvCr+TS3hiv33hTadVI+Hch58LH5o48LL";
+  pc = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJfV0pP4xYnWvCr+TS3hiv33hTadVI+Hch58LH5o48LL";
 
   # ── User SSH keys (optional – add your personal ed25519 pubkey here) ──────
-  # ryzengrind = "ssh-ed25519 AAAA<your-user-key-base64>";
+  ryzengrind = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIF9mqPel6SDM+iKmFLGEC+QxUCgISIt5hTOdcR/Ir5T5";
 
   # ── Optional: additional hosts (Oracle Cloud, etc.) ───────────────────────
   # oracle-arm = "ssh-ed25519 AAAA...";
 
   # ── All recipients for each secret ────────────────────────────────────────
-  allHosts = [ pc-25 ];
+  allHosts = [ pc ryzengrind ];
 in
 {
   # GitHub Personal Access Token for das-codegrep-mcp GitHub search features.
