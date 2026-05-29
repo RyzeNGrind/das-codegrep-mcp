@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 /**
- * das-codegrep-mcp — Local-first MCP Server v0.4.0
+ * das-codegrep-mcp — Local-first MCP Server v0.4.1
  * ─────────────────────────────────────────────────
  * Transport  : stdio (NixOS-WSL safe)
  * Local      : Zoekt trigram (100% offline)
- * Remote     : GitHub REST code search (PAT-auth, FLOSS API)
+ * Remote     : GitHub REST code search (PAT via agenix, FLOSS API)
  * Guard      : pre-ingress bad-pattern scanner
  *
  * Tools:
@@ -13,6 +13,8 @@
  *   search_github_code, refresh_github_starred,
  *   search_github_starred_code, search_everywhere
  *
+ * v0.4.1  fix(security): safeResolve path-traversal guard + ReDoS guard
+ *         agenix integration: DAS_GH_TOKEN read from /run/agenix/github-pat
  * v0.4.0  github.ts v0.4.0: FIX-1..5 + OPT-1..5
  *         renderRateLimitBlock: local time column added
  * v0.3.0  search_everywhere: partial results + rate-limit banner
@@ -48,11 +50,65 @@ import type {
   RateLimitInfo,
 } from "./github.js";
 
-const VERSION    = "0.4.0";
+const VERSION    = "0.4.1";
 const ZOEKT_PORT = parseInt(process.env.ZOEKT_PORT   ?? "6070");
 const INDEX_DIR  = process.env.DAS_INDEX_DIR ?? `${process.env.HOME}/.local/share/das-codegrep-mcp/index`;
 const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
 const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security: path-traversal guard
+// Semgrep: path-join-resolve-traversal — all user-supplied paths go through
+// safeResolve before any fs operation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Canonical allowed roots. Resolved once at startup. */
+const ALLOWED_ROOTS: readonly string[] = Object.freeze([
+  path.resolve(WORKSPACE),
+  path.resolve(INDEX_DIR),
+]);
+
+/**
+ * Resolve a user-supplied path and assert it stays within an allowed root.
+ * Throws an Error if the resolved path escapes all allowed roots.
+ * Extra roots can be appended per call-site if needed.
+ */
+function safeResolve(userPath: string, ...extraRoots: string[]): string {
+  const abs = path.isAbsolute(userPath)
+    ? path.resolve(userPath)
+    : path.resolve(WORKSPACE, userPath);
+  const roots = [...ALLOWED_ROOTS, ...extraRoots.map(r => path.resolve(r))];
+  const ok = roots.some(
+    r => abs === r || abs.startsWith(r + path.sep),
+  );
+  if (!ok) {
+    throw new Error(
+      `Path traversal denied: "${abs}" is outside allowed workspace roots.\n` +
+      `Allowed: ${roots.join(", ")}`
+    );
+  }
+  return abs;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security: ReDoS guard
+// Semgrep: detect-non-literal-regexp — validate user pattern before new RegExp()
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Catastrophic-backtracking patterns: nested quantifiers, e.g. (a+)+, .*.* */
+const REDOS_HEURISTIC = /([+*?]\s*[)\]][+*?]|\(.*?[+*].*?\)[+*?]|\.\*\.\*)/;
+
+/**
+ * Compile a user-supplied regex pattern safely.
+ * Rejects: empty, >200 chars, patterns matching ReDoS heuristic.
+ */
+function safeRegExp(pattern: string): RegExp {
+  if (!pattern || pattern.length > 200)
+    throw new Error(`Pattern rejected: must be 1–200 chars (got ${pattern.length}).`);
+  if (REDOS_HEURISTIC.test(pattern))
+    throw new Error(`Pattern rejected by ReDoS guard: nested quantifiers detected.`);
+  return new RegExp(pattern);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Query normaliser
@@ -120,6 +176,10 @@ const GUARD: GuardPattern[] = [
     severity:"error",
     regex:/\b(eval|exec|execSync)\s*\(/,
     tip:"Avoid dynamic code execution; use a safe parser or AST." },
+  { id:"eval-dollar",       label:"eval $() shell injection",
+    severity:"error",
+    regex:/eval\s+\$\(/,
+    tip:"Never eval shell subshell output." },
   { id:"shell-injection",   label:"Shell injection risk",
     severity:"error",
     regex:/child_process\.exec\s*\(\s*`[^`]*\$\{/,
@@ -223,7 +283,11 @@ async function zoektSearch(
 
 function zoektIndex(dir: string): Promise<string> {
   return new Promise(resolve => {
-    const abs = path.resolve(dir);
+    // safeResolve enforces workspace/index-dir boundary (semgrep: path-traversal)
+    let abs: string;
+    try { abs = safeResolve(dir); } catch (e) {
+      resolve(`❌ ${(e as Error).message}`); return;
+    }
     if (!fs.existsSync(abs)) { resolve(`❌ Directory not found: ${abs}`); return; }
     const proc = child_process.spawn(
       "zoekt-index",
@@ -341,7 +405,7 @@ const TOOLS: Tool[] = [
   // ── GitHub remote tools ──────────────────────────────────────────────────
   {
     name: "search_github_code",
-    description: "Search GitHub code via REST API (PAT-auth). Supports scope: global | user | repo.",
+    description: "Search GitHub code via REST API (PAT-auth via agenix). Supports scope: global | user | repo.",
     inputSchema: {
       type: "object",
       properties: {
@@ -356,7 +420,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "refresh_github_starred",
-    description: "Refresh the local cache of your GitHub starred repositories (uses DAS_GH_TOKEN).",
+    description: "Refresh the local cache of your GitHub starred repositories (uses DAS_GH_TOKEN from agenix).",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
   {
@@ -412,8 +476,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "index_directory") {
     const dir = String(args.directory ?? "");
-    const abs = path.isAbsolute(dir) ? dir : path.join(WORKSPACE, dir);
-    const text = await zoektIndex(abs);
+    // safeResolve called inside zoektIndex
+    const text = await zoektIndex(dir);
     return { content: [{ type: "text", text }] };
   }
 
@@ -425,8 +489,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === "guard_file") {
-    const p   = String(args.path ?? "");
-    const abs = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    const p = String(args.path ?? "");
+    let abs: string;
+    try { abs = safeResolve(p); } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
     try {
       const code = fs.readFileSync(abs, "utf-8");
       const hits = guardScan(code);
@@ -440,12 +507,21 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const p       = String(args.path ?? "");
     const pattern = String(args.pattern ?? "");
     const useRe   = Boolean(args.regex);
-    const abs     = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    let abs: string;
+    try { abs = safeResolve(p); } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
     try {
       const content = fs.readFileSync(abs, "utf-8");
       const lines   = content.split("\n");
-      const re      = useRe ? new RegExp(pattern) : null;
-      const hits    = lines
+      // safeRegExp guards against ReDoS (semgrep: detect-non-literal-regexp)
+      let re: RegExp | null = null;
+      if (useRe) {
+        try { re = safeRegExp(pattern); } catch (e) {
+          return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+        }
+      }
+      const hits = lines
         .map((l, i) => ({ l, i }))
         .filter(({ l }) => re ? re.test(l) : l.includes(pattern))
         .slice(0, 50)
@@ -462,7 +538,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (name === "read_file") {
     const p     = String(args.path ?? "");
     const limit = Number(args.lines ?? 300);
-    const abs   = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    let abs: string;
+    try { abs = safeResolve(p); } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
     try {
       const stat = fs.statSync(abs);
       if (stat.size > 200_000) return { content: [{ type: "text", text: `❌ File too large (${stat.size} bytes > 200 KB).` }] };
@@ -496,7 +575,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "zoekt_status") {
     try {
-      const resp = await axios.get(`${ZOEKT_BASE}/`, { timeout: 3000 });
+      await axios.get(`${ZOEKT_BASE}/`, { timeout: 3000 });
       const shards = fs.existsSync(INDEX_DIR)
         ? fs.readdirSync(INDEX_DIR).filter(f => f.endsWith(".zoekt")).length
         : 0;

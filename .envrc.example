@@ -1,0 +1,25 @@
+# das-codegrep-mcp — direnv environment template
+# ─────────────────────────────────────────────────────────────────────────────
+# NEVER put real secrets in this file. This file IS tracked by git.
+# Use one of the three agenix patterns below to inject DAS_GH_TOKEN.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Option A: agenix runtime secret (NixOS module wires this) ────────────────
+# The NixOS module (nix/modules/das-codegrep-mcp.nix) sets DAS_GH_TOKEN via
+# age.secrets.github-pat and passes it through environment.sessionVariables.
+# In that case you do NOT need to set it here — it's already in your shell env.
+#
+# export DAS_GH_TOKEN="$(< /run/agenix/github-pat)"
+
+# ── Option B: pass (GPG password store) ──────────────────────────────────────
+# export DAS_GH_TOKEN="$(pass github/das-codegrep-pat)"
+
+# ── Option C: systemd credentials (non-NixOS) ────────────────────────────────
+# export DAS_GH_TOKEN="$(cat /run/credentials/das-codegrep-mcp.service/github-pat 2>/dev/null)"
+
+# ── Required vars ─────────────────────────────────────────────────────────────
+export DAS_GH_USER="RyzeNGrind"
+export DAS_INDEX_DIR="${HOME}/.local/share/das-codegrep-mcp/index"
+export DAS_WORKSPACE="${HOME}/Workspaces"
+export DAS_ZOEKT_URL="http://127.0.0.1:6070"
+export ZOEKT_PORT="6070"
