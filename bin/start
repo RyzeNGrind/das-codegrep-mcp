@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Start das-codegrep-mcp stdio server (for manual MCP testing)
+# Run inside: nix develop
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+[ -f "$ROOT/src/dist/index.js" ] || {
+  printf 'dist/index.js not found — run ./bin/build first\n' >&2; exit 1
+}
+export DAS_INDEX_DIR="${DAS_INDEX_DIR:-$HOME/.local/share/das-codegrep-mcp/index}"
+export DAS_WORKSPACE="${DAS_WORKSPACE:-$ROOT}"
+export ZOEKT_PORT="${ZOEKT_PORT:-6070}"
+exec node "$ROOT/src/dist/index.js"

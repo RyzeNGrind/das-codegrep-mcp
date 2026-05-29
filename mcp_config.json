@@ -1,0 +1,73 @@
+{
+  "mcpServers": {
+    "das-codegrep": {
+      "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
+      "command": "nix",
+      "args": [
+        "shell",
+        "nixpkgs#nodejs_22",
+        "--command",
+        "node",
+        "/home/ryzengrind/Workspaces/das-codegrep-mcp/src/dist/index.js"
+      ],
+      "env": {
+        "DAS_INDEX_DIR": "/home/ryzengrind/.local/share/das-codegrep-mcp/index",
+        "DAS_WORKSPACE": "/home/ryzengrind/Workspaces",
+        "ZOEKT_PORT": "6070"
+      }
+    },
+    "github-mcp-server": {
+      "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-e",
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "ghcr.io/github/github-mcp-server"
+      ],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+      }
+    },
+    "perplexity-ask": {
+      "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
+      "command": "nix",
+      "args": [
+        "shell",
+        "nixpkgs#nodejs_22",
+        "--command",
+        "npx",
+        "-y",
+        "server-perplexity-ask"
+      ],
+      "env": {
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}"
+      }
+    },
+    "sequential-thinking": {
+      "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
+      "command": "nix",
+      "args": [
+        "shell",
+        "nixpkgs#nodejs_22",
+        "--command",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
+      "env": {}
+    },
+    "akirak-nix-playwright": {
+      "$typeName": "exa.cascade_plugins_pb.CascadePluginCommandTemplate",
+      "command": "nix",
+      "args": [
+        "run",
+        "github:akirak/nix-playwright-mcp/36813c06e74f71f60101d864203dc6c0e0f10918",
+        "--"
+      ],
+      "env": {}
+    }
+  }
+}

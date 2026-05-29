@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Compile TypeScript -> dist/
+# Run inside: nix develop
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+cd "$ROOT/src"
+[ -d node_modules ] || npm install --ignore-scripts --no-fund --no-audit --silent
+npx tsc
+printf 'OK: compiled -> %s/src/dist/index.js\n' "$ROOT"

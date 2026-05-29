@@ -2,8 +2,14 @@
   "servers": {
     "das-codegrep": {
       "type": "stdio",
-      "command": "node",
-      "args": ["${workspaceFolder}/src/dist/index.js"],
+      "command": "nix",
+      "args": [
+        "shell",
+        "nixpkgs#nodejs_22",
+        "--command",
+        "node",
+        "${workspaceFolder}/src/dist/index.js"
+      ],
       "env": {
         "DAS_INDEX_DIR": "${env:HOME}/.local/share/das-codegrep-mcp/index",
         "DAS_WORKSPACE": "${workspaceFolder}",
