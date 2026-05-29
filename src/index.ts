@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * das-codegrep-mcp — Local-first MCP Server
- * ─────────────────────────────────────────
+ * das-codegrep-mcp — Local-first MCP Server v0.1.4
+ * ─────────────────────────────────────────────────
  * Transport : stdio (NixOS-WSL safe)
  * Search    : Zoekt trigram (100% offline)
  * Guard     : pre-ingress bad-pattern scanner
  *
  * Tools: search_code, index_directory, guard_code, guard_file,
- *        search_file, read_file, list_index, zoekt_status
+ *        search_file, read_file, list_index, purge_index, zoekt_status
  */
 
 import { Server }               from "@modelcontextprotocol/sdk/server/index.js";
@@ -28,9 +28,7 @@ const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
 const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
 // ---------------------------------------------------------------------------
-// Zoekt query normaliser
-// Zoekt native syntax: lang:Nix  (Title-cased)
-// Accepts lowercase aliases: lang:nix, language:nix, ext:nix
+// Query normaliser  lang:nix → lang:Nix,  ext:nix → f:\.nix$
 // ---------------------------------------------------------------------------
 const LANG_TITLES: Record<string,string> = {
   nix:"Nix", ts:"TypeScript", typescript:"TypeScript",
@@ -46,19 +44,17 @@ const LANG_TITLES: Record<string,string> = {
 };
 
 function rewriteQuery(q: string): string {
-  // lang:xxx or language:xxx → lang:TitleCase
   let out = q.replace(/\b(?:lang|language):(\S+)/gi, (_m, l) => {
     const key = l.toLowerCase();
     return `lang:${LANG_TITLES[key] ?? l}`;
   });
-  // ext:nix → f:\.nix$
   out = out.replace(/\bext:(\S+)/gi, (_m, e) =>
     `f:\\.${e.replace(/^\./, "")}$`);
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Guard patterns — ordered most-severe first
+// Guard patterns
 // ---------------------------------------------------------------------------
 interface GuardPattern {
   id: string; label: string; severity: "error" | "warn"; regex: RegExp; tip: string;
@@ -115,14 +111,14 @@ function guardCode(code:string, filename="snippet"): GuardFinding[] {
 }
 
 // ---------------------------------------------------------------------------
-// Indexer — prefer zoekt-git-index for git repos (language detection via ctags)
+// Indexer — prefer zoekt-git-index for git repos
 // ---------------------------------------------------------------------------
 function zoektIndex(dirs: string[]): Promise<{stderr:string}> {
   const gitDirs   = dirs.filter(d => fs.existsSync(path.join(d, ".git")));
   const plainDirs = dirs.filter(d => !fs.existsSync(path.join(d, ".git")));
   const jobs: Promise<{stderr:string}>[] = [
     ...gitDirs.map(d => runIndexer("zoekt-git-index", ["-index", INDEX_DIR, d])),
-    ...plainDirs.map(d => runIndexer("zoekt-index",     ["-index", INDEX_DIR, d])),
+    ...plainDirs.map(d => runIndexer("zoekt-index",   ["-index", INDEX_DIR, d])),
   ];
   if (!jobs.length) return Promise.resolve({stderr:""});
   return Promise.all(jobs).then(rs => ({stderr: rs.map(r=>r.stderr).join("")}));
@@ -140,15 +136,13 @@ function runIndexer(bin: string, args: string[]): Promise<{stderr:string}> {
 }
 
 // ---------------------------------------------------------------------------
-// Zoekt REST search
-// Actual response shape (zoekt-webserver /search?format=json):
-//   { result: { FileMatches: [ { FileName, Repo, Language, Matches: [
-//       { LineNum, Fragments: [{ Pre, Match, Post }] } ] } ] } }
+// Zoekt REST search + dedup
+// Response: { result: { FileMatches: [{ FileName, Repo, Language,
+//   Matches: [{ LineNum, Fragments: [{Pre,Match,Post}] }] }] } }
+// Dedup key: fileName + lineNum + matchText  (collapses double-shard runs)
 // ---------------------------------------------------------------------------
-interface ZoektResult {
-  repo:string; fileName:string; language:string;
-  matches:{lineNum:number; pre:string; match:string; post:string}[];
-}
+interface ZoektMatch { lineNum:number; pre:string; match:string; post:string; }
+interface ZoektResult { repo:string; fileName:string; language:string; matches:ZoektMatch[]; }
 
 async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
   const rewritten = rewriteQuery(query);
@@ -156,23 +150,38 @@ async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
     const r = await axios.get(`${ZOEKT_BASE}/search`,
       {params:{q:rewritten,num:max,format:"json"},timeout:5000});
 
-    // Zoekt returns lowercase "result" key at top level
-    const data = r.data?.result ?? r.data?.Result ?? {};
+    const data  = r.data?.result ?? r.data?.Result ?? {};
     const files: any[] = data.FileMatches ?? data.Files ?? [];
 
-    return files.map((f:any) => ({
-      repo:     f.Repo     ?? f.Repository ?? "",
+    // Flatten to results
+    const raw: ZoektResult[] = files.map((f:any) => ({
+      repo:     f.Repo     ?? "",
       fileName: f.FileName ?? "",
       language: f.Language ?? "",
-      matches:  (f.Matches ?? f.LineMatches ?? []).flatMap((m:any) =>
+      matches:  (f.Matches ?? []).flatMap((m:any) =>
         (m.Fragments ?? []).map((frag:any) => ({
-          lineNum: m.LineNum ?? m.LineNumber ?? 0,
+          lineNum: m.LineNum ?? 0,
           pre:     frag.Pre   ?? "",
           match:   frag.Match ?? "",
           post:    frag.Post  ?? "",
         }))
       ),
     }));
+
+    // Dedup: keep first occurrence of each (fileName + lineNum + match)
+    const seen = new Set<string>();
+    const deduped: ZoektResult[] = [];
+    for (const r of raw) {
+      const dedupedMatches = r.matches.filter(m => {
+        const k = `${r.fileName}:${m.lineNum}:${m.match}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (dedupedMatches.length) deduped.push({...r, matches: dedupedMatches});
+    }
+    return deduped;
+
   } catch(e:any) {
     if(e?.code==="ECONNREFUSED") throw new Error(`Zoekt not running on ${ZOEKT_PORT}. Run: ./bin/dev-up`);
     throw e;
@@ -184,7 +193,7 @@ const TOOLS: Tool[] = [
    description:"Trigram search across indexed local codebases via Zoekt. Supports lang:nix, f:*.nix, ext:nix, regex, boolean ops.",
    inputSchema:{type:"object",properties:{query:{type:"string"},maxResults:{type:"number",default:15}},required:["query"]}},
   {name:"index_directory",
-   description:"Index local directories with Zoekt. Uses zoekt-git-index for git repos (better language detection), zoekt-index for plain dirs.",
+   description:"Index local directories with Zoekt. Uses zoekt-git-index for git repos (language-aware), zoekt-index for plain dirs.",
    inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}},required:["directories"]}},
   {name:"guard_code",
    description:"Scan a snippet for bad patterns (secrets, eval, rm -rf, curl-exec, Nix anti-patterns) BEFORE writing to workspace.",
@@ -201,13 +210,16 @@ const TOOLS: Tool[] = [
   {name:"list_index",
    description:"List all repos currently in the Zoekt index.",
    inputSchema:{type:"object",properties:{}}},
+  {name:"purge_index",
+   description:"Delete all stale/duplicate shards and re-index from scratch. Pass directories to re-index, or omit to just wipe.",
+   inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}}}},
   {name:"zoekt_status",
    description:"Check if local Zoekt server is running.",
    inputSchema:{type:"object",properties:{}}},
 ];
 
 const server = new Server(
-  {name:"das-codegrep-mcp",version:"0.1.3"},
+  {name:"das-codegrep-mcp",version:"0.1.4"},
   {capabilities:{tools:{}}},
 );
 
@@ -238,7 +250,7 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
         const {directories}=args as {directories:string[]};
         fs.mkdirSync(INDEX_DIR,{recursive:true});
         const {stderr}=await zoektIndex(directories);
-        const gitCount = directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
+        const gitCount   = directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
         const plainCount = directories.length - gitCount;
         return {content:[{type:"text",text:[
           `OK: indexed ${directories.length} dir(s) -> \`${INDEX_DIR}\``,
@@ -290,8 +302,24 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
         if(!fs.existsSync(INDEX_DIR))
           return {content:[{type:"text",text:`Index dir \`${INDEX_DIR}\` not found. Run index_directory.`}]};
         const shards=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt"));
-        const repos=[...new Set(shards.map(f=>f.replace(/_v\d+\.\d+\.zoekt$/,"")))];
+        const repos=[...new Set(shards.map(f=>f.replace(/_v\d+\.\d+\.zoekt$/,"").replace(/github\.com%2F\S+%2F/,"").replace(/%2F/g,"/")))];
         return {content:[{type:"text",text:`## Indexed (${repos.length} repo(s), ${shards.length} shard(s))\n${repos.map(r=>`- \`${r}\``).join("\n")||"None."}`}]};
+      }
+      case "purge_index": {
+        const {directories}=args as {directories?:string[]};
+        let purged = 0;
+        if(fs.existsSync(INDEX_DIR)){
+          const shards=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt"));
+          for(const s of shards){ fs.unlinkSync(path.join(INDEX_DIR,s)); purged++; }
+        }
+        let reindexMsg = "";
+        if(directories?.length){
+          fs.mkdirSync(INDEX_DIR,{recursive:true});
+          const {stderr}=await zoektIndex(directories);
+          const gitCount=directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
+          reindexMsg=`\nRe-indexed ${directories.length} dir(s) (${gitCount} git, ${directories.length-gitCount} plain).\n${stderr||""}`;
+        }
+        return {content:[{type:"text",text:`🗑️  Purged ${purged} shard(s) from \`${INDEX_DIR}\`.${reindexMsg}`}]};
       }
       case "zoekt_status": {
         try {
