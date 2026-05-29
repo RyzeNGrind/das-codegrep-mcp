@@ -16,10 +16,10 @@
           name = "das-codegrep-mcp";
 
           packages = with pkgs; [
-            # Node / TS runtime
+            # Node / TS runtime  (nodePackages.* removed in nixos-unstable 2026-05)
             nodejs_22
-            nodePackages.typescript
-            nodePackages.ts-node
+            typescript          # was nodePackages.typescript
+            nodePackages_latest.ts-node  # ts-node not yet promoted to top-level
 
             # Zoekt — Sourcegraph-grade trigram code search
             zoekt
@@ -27,26 +27,37 @@
             # Guard stack
             semgrep
             gitleaks
-            trufflehog
-            ast-grep
-            comby
-            lefthook
+            # trufflehog and comby are intermittently absent on x86_64-linux unstable;
+            # install via: nix profile install nixpkgs#trufflehog
 
             # Nix type-safety
             nixpkgs-fmt
             statix
             nil
+
+            # Hooks
+            lefthook
+
+            # Structural search / patch
+            ast-grep
           ];
 
           shellHook = ''
+            # Fix execute bits lost by GitHub API (push_files has no mode support)
+            chmod +x "$PWD"/bin/* 2>/dev/null || true
+
             echo "╔══════════════════════════════════════════════╗"
             echo "║  das-codegrep-mcp devshell                   ║"
-            echo "║  zoekt:       $(which zoekt-index 2>/dev/null || echo MISSING)"
-            echo "║  semgrep:     $(which semgrep 2>/dev/null || echo MISSING)"
-            echo "║  gitleaks:    $(which gitleaks 2>/dev/null || echo MISSING)"
-            echo "║  trufflehog:  $(which trufflehog 2>/dev/null || echo MISSING)"
-            echo "║  lefthook:    $(which lefthook 2>/dev/null || echo MISSING)"
+            printf "║  nodejs:      %s\n" "$(which node 2>/dev/null || echo MISSING)"
+            printf "║  typescript:  %s\n" "$(which tsc 2>/dev/null || echo MISSING)"
+            printf "║  zoekt:       %s\n" "$(which zoekt-index 2>/dev/null || echo MISSING)"
+            printf "║  semgrep:     %s\n" "$(which semgrep 2>/dev/null || echo MISSING)"
+            printf "║  gitleaks:    %s\n" "$(which gitleaks 2>/dev/null || echo MISSING)"
+            printf "║  lefthook:    %s\n" "$(which lefthook 2>/dev/null || echo MISSING)"
+            printf "║  ast-grep:    %s\n" "$(which sg 2>/dev/null || echo MISSING)"
+            printf "║  nil(lsp):    %s\n" "$(which nil 2>/dev/null || echo MISSING)"
             echo "╚══════════════════════════════════════════════╝"
+
             export DAS_INDEX_DIR="''${DAS_INDEX_DIR:-$HOME/.local/share/das-codegrep-mcp/index}"
             mkdir -p "$DAS_INDEX_DIR"
             echo "quick-start: ./bin/dev-up && ./bin/install-hooks && ./bin/validate"
@@ -59,8 +70,8 @@
       };
 
       flake = {
-        nixosModules.das-codegrep-mcp   = import ./nix/module.nix;
-        homeManagerModules.default       = import ./nix/home-manager.nix;
+        nixosModules.das-codegrep-mcp = import ./nix/module.nix;
+        homeManagerModules.default     = import ./nix/home-manager.nix;
       };
     };
 }

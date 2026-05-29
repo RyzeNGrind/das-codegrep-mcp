@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Deterministic local validation — run inside: nix develop
-# Usage: ./bin/validate
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
 cd "$ROOT"
-PASS=0; FAIL=0
-ok()  { printf '  OK   %s\n' "$1"; PASS=$((PASS+1)); }
-fail(){ printf '  FAIL %s: %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
+PASS=0; FAIL=0; SKIP=0
+ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$1"; PASS=$((PASS+1)); }
+fail() { printf '  \033[31mFAIL\033[0m  %s: %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
+skip() { printf '  \033[33mSKIP\033[0m  %s: %s\n' "$1" "$2"; SKIP=$((SKIP+1)); }
 
 printf '\n[1/8] nixpkgs-fmt\n'
 nixpkgs-fmt --check flake.nix nix/*.nix && ok nix-fmt || fail nix-fmt "formatter issues"
@@ -21,20 +21,34 @@ npx tsc --noEmit && ok tsc || fail tsc "type errors"
 cd ..
 
 printf '\n[4/8] semgrep\n'
-semgrep scan --config auto --error --exclude node_modules --exclude dist . && ok semgrep || fail semgrep "findings"
+semgrep scan --config auto --error --exclude node_modules --exclude dist . \
+  && ok semgrep || fail semgrep "findings"
 
 printf '\n[5/8] gitleaks\n'
 gitleaks dir . --no-banner && ok gitleaks || fail gitleaks "secrets detected"
 
 printf '\n[6/8] trufflehog\n'
-trufflehog filesystem . --no-update --fail --only-verified && ok trufflehog || fail trufflehog "verified secrets"
+if command -v trufflehog >/dev/null 2>&1; then
+  trufflehog filesystem . --no-update --fail --only-verified \
+    && ok trufflehog || fail trufflehog "verified secrets"
+else
+  skip trufflehog "not in PATH — nix profile install nixpkgs#trufflehog"
+fi
 
 printf '\n[7/8] ast-grep\n'
-sg scan -r sgconfig.yml . 2>/dev/null && ok ast-grep || ok "ast-grep (no rules yet)"
+if command -v sg >/dev/null 2>&1; then
+  sg scan -r sgconfig.yml . 2>/dev/null && ok ast-grep || ok "ast-grep (no rules yet)"
+else
+  skip ast-grep "not in PATH"
+fi
 
 printf '\n[8/8] zoekt binaries\n'
-command -v zoekt-webserver >/dev/null && command -v zoekt-index >/dev/null && ok zoekt-binaries || fail zoekt-binaries "missing"
+command -v zoekt-webserver >/dev/null && command -v zoekt-index >/dev/null \
+  && ok zoekt-binaries || fail zoekt-binaries "missing from PATH"
 
-printf '\n%s\n' "$(printf '%.0s─' {1..40})"
-printf 'PASS=%s  FAIL=%s\n' "$PASS" "$FAIL"
-[ "$FAIL" -eq 0 ] && printf 'OK: all checks passed\n' || { printf 'FAIL: fix issues above\n'; exit 1; }
+printf '\n%s\n' "$(printf '%.0s\u2500' {1..44})"
+printf 'PASS=\033[32m%s\033[0m  FAIL=\033[31m%s\033[0m  SKIP=\033[33m%s\033[0m\n' \
+  "$PASS" "$FAIL" "$SKIP"
+[ "$FAIL" -eq 0 ] \
+  && printf '\033[32mOK: all checks passed\033[0m\n' \
+  || { printf '\033[31mFAIL: fix the issues above before committing\033[0m\n'; exit 1; }
