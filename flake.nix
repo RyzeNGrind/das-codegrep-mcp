@@ -16,50 +16,59 @@
           name = "das-codegrep-mcp";
 
           packages = with pkgs; [
-            # Node / TS runtime  (nodePackages.* removed in nixos-unstable 2026-05)
-            nodejs_22
-            typescript          # was nodePackages.typescript
-            nodePackages_latest.ts-node  # ts-node not yet promoted to top-level
+            # ---- Node / TS runtime ----
+            # nodePackages.* and nodePackages_latest.* fully removed nixos-unstable 2026-05
+            # ts-node available via: npm install (devDependencies) + npx ts-node
+            nodejs_22   # provides node + npm + npx
+            typescript  # tsc binary – promoted to top-level
 
-            # Zoekt — Sourcegraph-grade trigram code search
+            # ---- Zoekt — offline trigram search ----
             zoekt
 
-            # Guard stack
+            # ---- Static analysis / secret scanning ----
             semgrep
             gitleaks
-            # trufflehog and comby are intermittently absent on x86_64-linux unstable;
-            # install via: nix profile install nixpkgs#trufflehog
+            ast-grep    # structural search (sg)
 
-            # Nix type-safety
+            # ---- Nix tooling ----
             nixpkgs-fmt
             statix
             nil
 
-            # Hooks
+            # ---- Git hooks ----
             lefthook
 
-            # Structural search / patch
-            ast-grep
+            # ---- Shell utils ----
+            jq
+            ripgrep
+            fd
           ];
 
           shellHook = ''
-            # Fix execute bits lost by GitHub API (push_files has no mode support)
+            # GitHub API push_files strips execute bits – restore on every shell entry
             chmod +x "$PWD"/bin/* 2>/dev/null || true
 
             echo "╔══════════════════════════════════════════════╗"
-            echo "║  das-codegrep-mcp devshell                   ║"
-            printf "║  nodejs:      %s\n" "$(which node 2>/dev/null || echo MISSING)"
-            printf "║  typescript:  %s\n" "$(which tsc 2>/dev/null || echo MISSING)"
-            printf "║  zoekt:       %s\n" "$(which zoekt-index 2>/dev/null || echo MISSING)"
-            printf "║  semgrep:     %s\n" "$(which semgrep 2>/dev/null || echo MISSING)"
-            printf "║  gitleaks:    %s\n" "$(which gitleaks 2>/dev/null || echo MISSING)"
-            printf "║  lefthook:    %s\n" "$(which lefthook 2>/dev/null || echo MISSING)"
-            printf "║  ast-grep:    %s\n" "$(which sg 2>/dev/null || echo MISSING)"
-            printf "║  nil(lsp):    %s\n" "$(which nil 2>/dev/null || echo MISSING)"
+            echo "║  das-codegrep-mcp devshell ready              ║"
             echo "╚══════════════════════════════════════════════╝"
+            printf '  node       %s\n' "$(node --version 2>/dev/null || echo MISSING)"
+            printf '  tsc        %s\n' "$(tsc --version 2>/dev/null || echo MISSING)"
+            printf '  zoekt      %s\n' "$(which zoekt-index 2>/dev/null || echo MISSING)"
+            printf '  semgrep    %s\n' "$(which semgrep 2>/dev/null || echo MISSING)"
+            printf '  gitleaks   %s\n' "$(which gitleaks 2>/dev/null || echo MISSING)"
+            printf '  lefthook   %s\n' "$(which lefthook 2>/dev/null || echo MISSING)"
+            printf '  ast-grep   %s\n' "$(which sg 2>/dev/null || echo MISSING)"
+            printf '  nil        %s\n' "$(which nil 2>/dev/null || echo MISSING)"
 
             export DAS_INDEX_DIR="''${DAS_INDEX_DIR:-$HOME/.local/share/das-codegrep-mcp/index}"
             mkdir -p "$DAS_INDEX_DIR"
+
+            # Install npm deps automatically if missing
+            if [ ! -d "$PWD/src/node_modules" ]; then
+              echo "[das-codegrep] npm install (first run)..."
+              (cd "$PWD/src" && npm install --ignore-scripts --no-fund --no-audit --silent)
+            fi
+
             echo "quick-start: ./bin/dev-up && ./bin/install-hooks && ./bin/validate"
           '';
         };
