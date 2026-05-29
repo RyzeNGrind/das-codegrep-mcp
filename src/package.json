@@ -1,11 +1,11 @@
 {
   "name": "das-codegrep-mcp",
-  "version": "0.1.0",
-  "description": "Local-first MCP server: Zoekt trigram code search + code guardian",
+  "version": "0.4.0",
+  "description": "Local-first MCP server: Zoekt trigram code search + GitHub starred search + code guardian",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "dev": "ts-node index.ts",
+    "dev": "ts-node src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit"
   },

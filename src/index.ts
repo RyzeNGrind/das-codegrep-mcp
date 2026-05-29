@@ -1,13 +1,23 @@
 #!/usr/bin/env node
 /**
- * das-codegrep-mcp — Local-first MCP Server v0.1.4
+ * das-codegrep-mcp — Local-first MCP Server v0.4.0
  * ─────────────────────────────────────────────────
- * Transport : stdio (NixOS-WSL safe)
- * Search    : Zoekt trigram (100% offline)
- * Guard     : pre-ingress bad-pattern scanner
+ * Transport  : stdio (NixOS-WSL safe)
+ * Local      : Zoekt trigram (100% offline)
+ * Remote     : GitHub REST code search (PAT-auth, FLOSS API)
+ * Guard      : pre-ingress bad-pattern scanner
  *
- * Tools: search_code, index_directory, guard_code, guard_file,
- *        search_file, read_file, list_index, purge_index, zoekt_status
+ * Tools:
+ *   search_code, index_directory, guard_code, guard_file,
+ *   search_file, read_file, list_index, purge_index, zoekt_status
+ *   search_github_code, refresh_github_starred,
+ *   search_github_starred_code, search_everywhere
+ *
+ * v0.4.0  github.ts v0.4.0: FIX-1..5 + OPT-1..5
+ *         renderRateLimitBlock: local time column added
+ * v0.3.0  search_everywhere: partial results + rate-limit banner
+ *         all GitHub tools include rate-limit block when gate engaged
+ *         partial search cache: re-run resumes from last flush
  */
 
 import { Server }               from "@modelcontextprotocol/sdk/server/index.js";
@@ -15,32 +25,49 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
-  Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import axios  from "axios";
+import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import axios   from "axios";
 import * as fs from "fs";
 import * as path from "path";
 import * as child_process from "child_process";
 
-const ZOEKT_PORT = parseInt(process.env.ZOEKT_PORT  ?? "6070");
+import {
+  ghCodeSearch,
+  searchStarredCode,
+  starredCacheRefresh,
+  loadStarredCache,
+  peekStarredCache,
+  formatGhHits,
+  rateLimitStatus,
+} from "./github.js";
+import type {
+  GhCodeHit,
+  GhSearchScope,
+  StarredSearchResult,
+  RateLimitInfo,
+} from "./github.js";
+
+const VERSION    = "0.4.0";
+const ZOEKT_PORT = parseInt(process.env.ZOEKT_PORT   ?? "6070");
 const INDEX_DIR  = process.env.DAS_INDEX_DIR ?? `${process.env.HOME}/.local/share/das-codegrep-mcp/index`;
 const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
 const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
-// ---------------------------------------------------------------------------
-// Query normaliser  lang:nix → lang:Nix,  ext:nix → f:\.nix$
-// ---------------------------------------------------------------------------
-const LANG_TITLES: Record<string,string> = {
+// ─────────────────────────────────────────────────────────────────────────────
+// Query normaliser
+// ─────────────────────────────────────────────────────────────────────────────
+const LANG_TITLES: Record<string, string> = {
   nix:"Nix", ts:"TypeScript", typescript:"TypeScript",
   js:"JavaScript", javascript:"JavaScript",
-  py:"Python", python:"Python",
-  rs:"Rust", rust:"Rust",
-  sh:"Shell", bash:"Shell", shell:"Shell",
-  go:"Go", c:"C", cpp:"C++",
-  java:"Java", rb:"Ruby", ruby:"Ruby",
-  md:"Markdown", markdown:"Markdown",
-  json:"JSON", yaml:"YAML", toml:"TOML",
-  html:"HTML", css:"CSS",
+  py:"Python",  python:"Python",
+  rs:"Rust",    rust:"Rust",
+  sh:"Shell",   bash:"Shell",    shell:"Shell",
+  go:"Go",      c:"C",           cpp:"C++",
+  java:"Java",  rb:"Ruby",       ruby:"Ruby",
+  md:"Markdown",markdown:"Markdown",
+  json:"JSON",  yaml:"YAML",     toml:"TOML",
+  html:"HTML",  css:"CSS",
 };
 
 function rewriteQuery(q: string): string {
@@ -53,291 +80,588 @@ function rewriteQuery(q: string): string {
   return out;
 }
 
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate-limit info block renderer (v0.4.0: local time column)
+// ─────────────────────────────────────────────────────────────────────────────
+function renderRateLimitBlock(info: RateLimitInfo | null | undefined): string {
+  if (!info) return "";
+  const localStr = new Date(info.resetAt).toLocaleTimeString("en-US", {
+    hour12: false, timeZoneName: "short",
+  });
+  return [
+    "",
+    "---",
+    "### ⏸ GitHub Rate-Limit Status",
+    `| Field | Value |`,
+    `|-------|-------|`,
+    `| 🕐 Reset at (UTC)    | \`${info.resetAt}\` |`,
+    `| 🕐 Reset at (local)  | \`${localStr}\` |`,
+    `| ⏳ Reset in           | **${info.resetHuman}** |`,
+    `| 📊 Remaining / Limit  | ${info.remaining} / ${info.limit} |`,
+    ``,
+    `> ⚡ **Re-run after reset to resume from partial cache** — previous results are preserved.`,
+    "",
+  ].join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Guard patterns
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
 interface GuardPattern {
   id: string; label: string; severity: "error" | "warn"; regex: RegExp; tip: string;
 }
 
 const GUARD: GuardPattern[] = [
   { id:"hardcoded-secret",  label:"Hardcoded secret/token",
-    severity:"error", regex:/(api[_-]?key|secret|token|password)\s*=\s*["'][^"']{8,}["']/i,
-    tip:"Use sops-nix, age, or environment variables." },
-  { id:"eval-usage", label:"eval() / eval $() / eval `` call",
-    severity:"error", regex:/\beval\s*(\(|\$\(|`)/,
-    tip:"eval is a code-injection vector. Refactor to avoid it." },
-  { id:"curl-exec", label:"Remote code execution via curl/wget",
     severity:"error",
-    regex:/curl[^|#\n]*\|\s*(ba)?sh|wget[^|#\n]*\|\s*(ba)?sh|eval\s+\$\(\s*(curl|wget)|bash\s+<\(\s*(curl|wget)/,
-    tip:"Verify checksums — never execute remote content directly." },
-  { id:"rm-rf", label:"rm -rf without guard",
-    severity:"error", regex:/rm\s+-rf?\s+[^$\{]/,
-    tip:"Add path validation or use safer deletion patterns." },
-  { id:"nix-fetchurl-nohash", label:"fetchurl/fetchTarball without hash",
-    severity:"error", regex:/fetch(url|Tarball)\s*\{[^}]*url[^}]*\}/,
-    tip:"Pin with sha256 for reproducibility." },
-  { id:"nix-with-pkgs", label:"with pkgs; anti-pattern",
-    severity:"warn", regex:/with\s+pkgs\s*;/,
-    tip:"Prefer explicit pkgs.foo over with pkgs;" },
-  { id:"console-log", label:"console.log in source",
-    severity:"warn", regex:/console\.log\(/,
-    tip:"Use a structured logger for production code." },
-  { id:"todo-fixme", label:"TODO/FIXME left in code",
-    severity:"warn", regex:/\b(TODO|FIXME|HACK|XXX)\b/,
-    tip:"Track in your issue tracker instead." },
-  { id:"empty-catch", label:"Empty catch block",
-    severity:"warn", regex:/catch\s*\([^)]*\)\s*\{\s*\}/,
-    tip:"Always handle or re-throw errors." },
-  { id:"any-type", label:"TypeScript any type",
-    severity:"warn", regex:/:\s*any\b/,
-    tip:"Use specific types or unknown + type narrowing." },
+    regex:/(api[_-]?key|secret|token|password)\s*=\s*["'][^"']{8,}["']/i,
+    tip:"Move secrets to env vars or sops-nix / agenix." },
+  { id:"eval-exec",         label:"eval() / exec() / execSync()",
+    severity:"error",
+    regex:/\b(eval|exec|execSync)\s*\(/,
+    tip:"Avoid dynamic code execution; use a safe parser or AST." },
+  { id:"shell-injection",   label:"Shell injection risk",
+    severity:"error",
+    regex:/child_process\.exec\s*\(\s*`[^`]*\$\{/,
+    tip:"Use execFile() or spawnSync() with arg arrays." },
+  { id:"path-traversal",    label:"Path traversal",
+    severity:"error",
+    regex:/\.\.\/|\.\.\\|path\.join\([^)]*req\./i,
+    tip:"Validate and sanitise all user-supplied paths." },
+  { id:"todo-fixme",        label:"TODO / FIXME / HACK",
+    severity:"warn",
+    regex:/\b(TODO|FIXME|HACK|XXX)\b/,
+    tip:"Resolve before merging." },
+  { id:"console-log",       label:"console.log left in code",
+    severity:"warn",
+    regex:/console\.log\s*\(/,
+    tip:"Replace with structured logging." },
+  { id:"nix-ifd",           label:"Nix IFD (import-from-derivation)",
+    severity:"warn",
+    regex:/import\s+\(.*(?:mkDerivation|runCommand)/,
+    tip:"Avoid IFD in flakes; pre-generate or use builtins." },
 ];
 
-interface GuardFinding {
-  pattern:string; label:string; severity:"error"|"warn";
-  line:number; lineText:string; tip:string; filename:string;
+interface GuardHit {
+  pattern:  GuardPattern;
+  line:     number;
+  col:      number;
+  snippet:  string;
 }
 
-function guardCode(code:string, filename="snippet"): GuardFinding[] {
-  const findings:GuardFinding[] = [];
-  code.split("\n").forEach((l,i) => {
-    for (const p of GUARD)
-      if (p.regex.test(l))
-        findings.push({pattern:p.id,label:p.label,severity:p.severity,
-          line:i+1,lineText:l.trim().slice(0,120),tip:p.tip,filename});
-  });
-  return findings;
-}
-
-// ---------------------------------------------------------------------------
-// Indexer — prefer zoekt-git-index for git repos
-// ---------------------------------------------------------------------------
-function zoektIndex(dirs: string[]): Promise<{stderr:string}> {
-  const gitDirs   = dirs.filter(d => fs.existsSync(path.join(d, ".git")));
-  const plainDirs = dirs.filter(d => !fs.existsSync(path.join(d, ".git")));
-  const jobs: Promise<{stderr:string}>[] = [
-    ...gitDirs.map(d => runIndexer("zoekt-git-index", ["-index", INDEX_DIR, d])),
-    ...plainDirs.map(d => runIndexer("zoekt-index",   ["-index", INDEX_DIR, d])),
-  ];
-  if (!jobs.length) return Promise.resolve({stderr:""});
-  return Promise.all(jobs).then(rs => ({stderr: rs.map(r=>r.stderr).join("")}));
-}
-
-function runIndexer(bin: string, args: string[]): Promise<{stderr:string}> {
-  return new Promise((res, rej) => {
-    const p = child_process.spawn(bin, args, {stdio:"pipe"});
-    let stderr = "";
-    p.stderr.on("data", (d:Buffer) => stderr += d.toString());
-    p.on("close", c => c === 0
-      ? res({stderr})
-      : rej(new Error(`${bin} exited ${c}: ${stderr}`)));
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Zoekt REST search + dedup
-// Response: { result: { FileMatches: [{ FileName, Repo, Language,
-//   Matches: [{ LineNum, Fragments: [{Pre,Match,Post}] }] }] } }
-// Dedup key: fileName + lineNum + matchText  (collapses double-shard runs)
-// ---------------------------------------------------------------------------
-interface ZoektMatch { lineNum:number; pre:string; match:string; post:string; }
-interface ZoektResult { repo:string; fileName:string; language:string; matches:ZoektMatch[]; }
-
-async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
-  const rewritten = rewriteQuery(query);
-  try {
-    const r = await axios.get(`${ZOEKT_BASE}/search`,
-      {params:{q:rewritten,num:max,format:"json"},timeout:5000});
-
-    const data  = r.data?.result ?? r.data?.Result ?? {};
-    const files: any[] = data.FileMatches ?? data.Files ?? [];
-
-    // Flatten to results
-    const raw: ZoektResult[] = files.map((f:any) => ({
-      repo:     f.Repo     ?? "",
-      fileName: f.FileName ?? "",
-      language: f.Language ?? "",
-      matches:  (f.Matches ?? []).flatMap((m:any) =>
-        (m.Fragments ?? []).map((frag:any) => ({
-          lineNum: m.LineNum ?? 0,
-          pre:     frag.Pre   ?? "",
-          match:   frag.Match ?? "",
-          post:    frag.Post  ?? "",
-        }))
-      ),
-    }));
-
-    // Dedup: keep first occurrence of each (fileName + lineNum + match)
-    const seen = new Set<string>();
-    const deduped: ZoektResult[] = [];
-    for (const r of raw) {
-      const dedupedMatches = r.matches.filter(m => {
-        const k = `${r.fileName}:${m.lineNum}:${m.match}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      if (dedupedMatches.length) deduped.push({...r, matches: dedupedMatches});
+function guardScan(code: string): GuardHit[] {
+  const hits: GuardHit[] = [];
+  const lines = code.split("\n");
+  for (let li = 0; li < lines.length; li++) {
+    for (const p of GUARD) {
+      const m = p.regex.exec(lines[li]);
+      if (m) hits.push({ pattern: p, line: li + 1, col: m.index + 1, snippet: lines[li].trim().slice(0, 120) });
     }
-    return deduped;
+  }
+  return hits;
+}
 
-  } catch(e:any) {
-    if(e?.code==="ECONNREFUSED") throw new Error(`Zoekt not running on ${ZOEKT_PORT}. Run: ./bin/dev-up`);
-    throw e;
+function renderGuardHits(hits: GuardHit[], source: string): string {
+  if (!hits.length) return `✅ **No issues found** in \`${source}\`.`;
+  const errors = hits.filter(h => h.pattern.severity === "error");
+  const warns  = hits.filter(h => h.pattern.severity === "warn");
+  const header = `🚨 **${errors.length} error(s), ${warns.length} warning(s)** in \`${source}\`\n`;
+  const rows = hits.map(h =>
+    `| ${h.pattern.severity === "error" ? "🔴" : "🟡"} | L${h.line}:C${h.col} | **${h.pattern.label}** | \`${h.snippet}\` | ${h.pattern.tip} |`
+  ).join("\n");
+  return header +
+    `\n| Sev | Loc | Pattern | Snippet | Tip |\n|-----|-----|---------|---------|-----|\n${rows}`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Zoekt helpers
+// ─────────────────────────────────────────────────────────────────────────────
+interface ZoektFile {
+  FileName: string;
+  Repository: string;
+  Branches: string[];
+  Language: string;
+  LineMatches?: ZoektLineMatch[];
+  ChunkMatches?: ZoektChunkMatch[];
+}
+
+interface ZoektLineMatch  { Line: string; LineNumber: number; }
+interface ZoektChunkMatch { Content: string; Ranges: Array<{ Start: { Line: number } }> }
+
+async function zoektSearch(
+  query: string,
+  maxResults = 20,
+  contextLines = 2,
+): Promise<string> {
+  try {
+    const resp = await axios.post(
+      `${ZOEKT_BASE}/search`,
+      { Q: query, Opts: { NumContextLines: contextLines, MaxDocDisplayCount: maxResults } },
+      { timeout: 10_000 },
+    );
+    const files: ZoektFile[] = resp.data?.Result?.Files ?? [];
+    if (!files.length) return "*No local results.*";
+    return files.map(f => {
+      const chunks = [
+        ...(f.LineMatches ?? []).map(lm =>
+          `  L${lm.LineNumber}: ${lm.Line.trim().slice(0, 160)}`
+        ),
+        ...(f.ChunkMatches ?? []).map(cm =>
+          `  L${cm.Ranges[0]?.Start.Line ?? "?"}: ${cm.Content.trim().slice(0, 160)}`
+        ),
+      ];
+      return [
+        `**${f.Repository}** — \`${f.FileName}\` (${f.Language})`,
+        ...chunks.slice(0, 5),
+      ].join("\n");
+    }).join("\n\n");
+  } catch (e: unknown) {
+    const msg = (e as Error).message;
+    return `⚠️ Zoekt unavailable: ${msg}\nStart zoekt-webserver: \`zoekt-webserver -index ${INDEX_DIR}\``;
   }
 }
 
+function zoektIndex(dir: string): Promise<string> {
+  return new Promise(resolve => {
+    const abs = path.resolve(dir);
+    if (!fs.existsSync(abs)) { resolve(`❌ Directory not found: ${abs}`); return; }
+    const proc = child_process.spawn(
+      "zoekt-index",
+      ["-index", INDEX_DIR, abs],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let out = "", err = "";
+    proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+    proc.stderr?.on("data", (d: Buffer) => { err += d.toString(); });
+    proc.on("close", code => {
+      if (code === 0) resolve(`✅ Indexed \`${abs}\` → \`${INDEX_DIR}\`\n${out.trim()}`);
+      else            resolve(`❌ zoekt-index failed (exit ${code})\n${err.trim()}`);
+    });
+    proc.on("error", e => resolve(`❌ zoekt-index not found: ${(e as Error).message}\nnix-env -iA nixpkgs.zoekt`));
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool schemas
+// ─────────────────────────────────────────────────────────────────────────────
 const TOOLS: Tool[] = [
-  {name:"search_code",
-   description:"Trigram search across indexed local codebases via Zoekt. Supports lang:nix, f:*.nix, ext:nix, regex, boolean ops.",
-   inputSchema:{type:"object",properties:{query:{type:"string"},maxResults:{type:"number",default:15}},required:["query"]}},
-  {name:"index_directory",
-   description:"Index local directories with Zoekt. Uses zoekt-git-index for git repos (language-aware), zoekt-index for plain dirs.",
-   inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}},required:["directories"]}},
-  {name:"guard_code",
-   description:"Scan a snippet for bad patterns (secrets, eval, rm -rf, curl-exec, Nix anti-patterns) BEFORE writing to workspace.",
-   inputSchema:{type:"object",properties:{code:{type:"string"},filename:{type:"string"}},required:["code"]}},
-  {name:"guard_file",
-   description:"Scan an existing local file for bad patterns (read-only).",
-   inputSchema:{type:"object",properties:{filePath:{type:"string"}},required:["filePath"]}},
-  {name:"search_file",
-   description:"Search for files by name/glob in workspace.",
-   inputSchema:{type:"object",properties:{pattern:{type:"string"},searchDir:{type:"string"},maxDepth:{type:"number",default:10}},required:["pattern"]}},
-  {name:"read_file",
-   description:"Read a local file, optionally by line range.",
-   inputSchema:{type:"object",properties:{filePath:{type:"string"},startLine:{type:"number"},endLine:{type:"number"}},required:["filePath"]}},
-  {name:"list_index",
-   description:"List all repos currently in the Zoekt index.",
-   inputSchema:{type:"object",properties:{}}},
-  {name:"purge_index",
-   description:"Delete all stale/duplicate shards and re-index from scratch. Pass directories to re-index, or omit to just wipe.",
-   inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}}}},
-  {name:"zoekt_status",
-   description:"Check if local Zoekt server is running.",
-   inputSchema:{type:"object",properties:{}}},
+  {
+    name: "search_code",
+    description: "Trigram code search across locally-indexed repositories using Zoekt. Fast, offline, privacy-preserving.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query:       { type: "string",  description: "Search query. Supports lang:Nix, ext:ts, repo:name, regex." },
+        maxResults:  { type: "number",  description: "Max files to return (default 20)." },
+        contextLines:{ type: "number",  description: "Lines of context around matches (default 2)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "index_directory",
+    description: "Index a local directory into Zoekt for future search_code queries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        directory: { type: "string", description: "Absolute or workspace-relative path to index." },
+      },
+      required: ["directory"],
+    },
+  },
+  {
+    name: "guard_code",
+    description: "Scan a code snippet for security issues, bad patterns, and Nix anti-patterns before it enters your workspace.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        code:     { type: "string", description: "Source code to scan." },
+        filename: { type: "string", description: "Optional filename hint (for context)." },
+      },
+      required: ["code"],
+    },
+  },
+  {
+    name: "guard_file",
+    description: "Scan an existing file in the workspace for bad patterns.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute or workspace-relative path." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "search_file",
+    description: "Grep a file for a pattern (ripgrep-style, literal or regex).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path:    { type: "string", description: "File path." },
+        pattern: { type: "string", description: "Search pattern." },
+        regex:   { type: "boolean",description: "Treat pattern as regex (default false)." },
+      },
+      required: ["path", "pattern"],
+    },
+  },
+  {
+    name: "read_file",
+    description: "Read a file from the workspace (max 200 KB).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path:  { type: "string", description: "File path." },
+        lines: { type: "number", description: "Max lines to return (default 300)." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_index",
+    description: "List all repositories currently in the Zoekt index.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "purge_index",
+    description: "Delete all shard files from the Zoekt index directory.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        confirm: { type: "boolean", description: "Must be true to confirm destructive operation." },
+      },
+      required: ["confirm"],
+    },
+  },
+  {
+    name: "zoekt_status",
+    description: "Show Zoekt server status, index directory, and server version.",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  // ── GitHub remote tools ──────────────────────────────────────────────────
+  {
+    name: "search_github_code",
+    description: "Search GitHub code via REST API (PAT-auth). Supports scope: global | user | repo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query:    { type: "string",  description: "Code search query." },
+        language: { type: "string",  description: "Language filter (e.g. Nix, TypeScript)." },
+        scope:    { type: "string",  description: "global | user | repo (default: user)." },
+        repos:    { type: "array",   items: { type: "string" }, description: "Repo list for scope=repo." },
+        limit:    { type: "number",  description: "Max results (default 10)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "refresh_github_starred",
+    description: "Refresh the local cache of your GitHub starred repositories (uses DAS_GH_TOKEN).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "search_github_starred_code",
+    description: "Search code across your GitHub starred repos. Uses local starred cache + GH code search API. Partial results are cached; re-run to resume after rate-limit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query:        { type: "string",  description: "Code search query." },
+        language:     { type: "string",  description: "Language filter." },
+        limitPerRepo: { type: "number",  description: "Max hits per repo (default 3)." },
+        maxRepos:     { type: "number",  description: "Max repos to search (default 60)." },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "search_everywhere",
+    description: "Fan-out code search: local Zoekt + GitHub starred (parallel). Best for 'find vllm examples everywhere'.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query:    { type: "string",  description: "Search query." },
+        language: { type: "string",  description: "Language filter." },
+        scope:    { type: "string",  description: "local | github | all (default: all)." },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Server
+// ─────────────────────────────────────────────────────────────────────────────
 const server = new Server(
-  {name:"das-codegrep-mcp",version:"0.1.4"},
-  {capabilities:{tools:{}}},
+  { name: "das-codegrep-mcp", version: VERSION },
+  { capabilities: { tools: {} } },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async()=>({tools:TOOLS}));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-server.setRequestHandler(CallToolRequestSchema, async(req)=>{
-  const {name, arguments:args} = req.params;
-  try {
-    switch(name) {
-      case "search_code": {
-        const {query,maxResults=15}=args as {query:string;maxResults?:number};
-        const rewritten = rewriteQuery(query);
-        const rs=await zoektSearch(query,maxResults);
-        if(!rs.length) return {content:[{type:"text",text:[
-          `No results for \`${rewritten}\`.`,
-          `Try: 1) run index_directory first  2) drop lang: filter  3) broaden terms`,
-          `Query hint: lang:Nix mkIf  OR  f:\\.nix$ mkIf  OR  ext:nix mkIf`,
-        ].join("\n")}]};
-        const out=rs.map(r=>{
-          const lines = r.matches.map(m =>
-            `> L${m.lineNum} | ${m.pre}**${m.match}**${m.post}`
-          ).join("\n");
-          return `## ${r.fileName} (${r.language||"?"} · ${r.repo})\n${lines}`;
-        }).join("\n\n");
-        return {content:[{type:"text",text:`# Trigram: \`${rewritten}\`\n**${rs.length} file(s)**\n\n${out}`}]};
-      }
-      case "index_directory": {
-        const {directories}=args as {directories:string[]};
-        fs.mkdirSync(INDEX_DIR,{recursive:true});
-        const {stderr}=await zoektIndex(directories);
-        const gitCount   = directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
-        const plainCount = directories.length - gitCount;
-        return {content:[{type:"text",text:[
-          `OK: indexed ${directories.length} dir(s) -> \`${INDEX_DIR}\``,
-          `  ${gitCount} git repo(s) via zoekt-git-index (language-aware)`,
-          `  ${plainCount} plain dir(s) via zoekt-index`,
-          stderr||"(no indexer output)",
-        ].join("\n")}]};
-      }
-      case "guard_code": {
-        const {code,filename="snippet"}=args as {code:string;filename?:string};
-        const findings=guardCode(code,filename);
-        if(!findings.length) return {content:[{type:"text",text:`✅ Guard PASS — \`${filename}\` clean.`}]};
-        const errors=findings.filter(f=>f.severity==="error");
-        const warns=findings.filter(f=>f.severity==="warn");
-        const fmt=(f:GuardFinding)=>`**[${f.severity.toUpperCase()}]** \`${f.label}\` L${f.line}\n> \`${f.lineText}\`\n> 💡 ${f.tip}`;
-        const blocked = errors.length > 0;
-        return {content:[{type:"text",text:[
-          `# Guard: \`${filename}\` — ${blocked?"🚫 BLOCKED":"⚠️  WARNINGS"}`,
-          errors.length?`## Errors\n${errors.map(fmt).join("\n\n")}` :"",
-          warns.length?`## Warnings\n${warns.map(fmt).join("\n\n")}` :"",
-          `${errors.length} error(s) · ${warns.length} warning(s)${blocked?" — fix errors before writing to workspace.":""}`,
-        ].filter(Boolean).join("\n\n")}]};
-      }
-      case "guard_file": {
-        const {filePath}=args as {filePath:string};
-        const code=fs.readFileSync(filePath,"utf8");
-        const findings=guardCode(code,path.basename(filePath));
-        if(!findings.length) return {content:[{type:"text",text:`✅ Guard PASS — \`${filePath}\``}]};
-        const fmt=(f:GuardFinding)=>`- **[${f.severity.toUpperCase()}]** L${f.line}: \`${f.label}\`\n  💡 ${f.tip}`;
-        return {content:[{type:"text",text:`# Guard: ${filePath}\n\n${findings.map(fmt).join("\n\n")}`}]};
-      }
-      case "search_file": {
-        const {pattern,searchDir,maxDepth=10}=args as {pattern:string;searchDir?:string;maxDepth?:number};
-        const base=searchDir??WORKSPACE;
-        const r=child_process.spawnSync("find",[base,"-maxdepth",String(maxDepth),"-name",pattern,"-type","f"],{encoding:"utf8"});
-        const files=r.stdout.trim().split("\n").filter(Boolean);
-        return {content:[{type:"text",text:files.length
-          ?`Found ${files.length} file(s):\n\`\`\`\n${files.join("\n")}\n\`\`\``
-          :`No files matching \`${pattern}\` in \`${base}\``}]};
-      }
-      case "read_file": {
-        const {filePath,startLine,endLine}=args as {filePath:string;startLine?:number;endLine?:number};
-        const lines=fs.readFileSync(filePath,"utf8").split("\n");
-        const sl=startLine?startLine-1:0;
-        const el=endLine?endLine:lines.length;
-        return {content:[{type:"text",text:`\`\`\`\n${lines.slice(sl,el).join("\n")}\n\`\`\``}]};
-      }
-      case "list_index": {
-        if(!fs.existsSync(INDEX_DIR))
-          return {content:[{type:"text",text:`Index dir \`${INDEX_DIR}\` not found. Run index_directory.`}]};
-        const shards=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt"));
-        const repos=[...new Set(shards.map(f=>f.replace(/_v\d+\.\d+\.zoekt$/,"").replace(/github\.com%2F\S+%2F/,"").replace(/%2F/g,"/")))];
-        return {content:[{type:"text",text:`## Indexed (${repos.length} repo(s), ${shards.length} shard(s))\n${repos.map(r=>`- \`${r}\``).join("\n")||"None."}`}]};
-      }
-      case "purge_index": {
-        const {directories}=args as {directories?:string[]};
-        let purged = 0;
-        if(fs.existsSync(INDEX_DIR)){
-          const shards=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt"));
-          for(const s of shards){ fs.unlinkSync(path.join(INDEX_DIR,s)); purged++; }
-        }
-        let reindexMsg = "";
-        if(directories?.length){
-          fs.mkdirSync(INDEX_DIR,{recursive:true});
-          const {stderr}=await zoektIndex(directories);
-          const gitCount=directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
-          reindexMsg=`\nRe-indexed ${directories.length} dir(s) (${gitCount} git, ${directories.length-gitCount} plain).\n${stderr||""}`;
-        }
-        return {content:[{type:"text",text:`🗑️  Purged ${purged} shard(s) from \`${INDEX_DIR}\`.${reindexMsg}`}]};
-      }
-      case "zoekt_status": {
-        try {
-          await axios.get(`${ZOEKT_BASE}/`,{timeout:2000});
-          return {content:[{type:"text",text:`✅ Zoekt running @ \`${ZOEKT_BASE}\`  index: \`${INDEX_DIR}\``}]};
-        } catch {
-          return {content:[{type:"text",text:`❌ Zoekt not running. Run: ./bin/dev-up`}]};
-        }
-      }
-      default: throw new Error(`Unknown tool: ${name}`);
-    }
-  } catch(e:any) {
-    return {content:[{type:"text",text:`ERROR: ${e?.message??String(e)}`}],isError:true};
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: args = {} } = req.params;
+
+  // ── local tools ───────────────────────────────────────────────────────────
+  if (name === "search_code") {
+    const q    = rewriteQuery(String(args.query ?? ""));
+    const maxR = Number(args.maxResults   ?? 20);
+    const ctx  = Number(args.contextLines ?? 2);
+    const text = await zoektSearch(q, maxR, ctx);
+    return { content: [{ type: "text", text: `## 🔍 Local: \`${q}\`\n\n${text}` }] };
   }
+
+  if (name === "index_directory") {
+    const dir = String(args.directory ?? "");
+    const abs = path.isAbsolute(dir) ? dir : path.join(WORKSPACE, dir);
+    const text = await zoektIndex(abs);
+    return { content: [{ type: "text", text }] };
+  }
+
+  if (name === "guard_code") {
+    const code = String(args.code ?? "");
+    const src  = String(args.filename ?? "<snippet>");
+    const hits = guardScan(code);
+    return { content: [{ type: "text", text: renderGuardHits(hits, src) }] };
+  }
+
+  if (name === "guard_file") {
+    const p   = String(args.path ?? "");
+    const abs = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    try {
+      const code = fs.readFileSync(abs, "utf-8");
+      const hits = guardScan(code);
+      return { content: [{ type: "text", text: renderGuardHits(hits, abs) }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ Cannot read file: ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "search_file") {
+    const p       = String(args.path ?? "");
+    const pattern = String(args.pattern ?? "");
+    const useRe   = Boolean(args.regex);
+    const abs     = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    try {
+      const content = fs.readFileSync(abs, "utf-8");
+      const lines   = content.split("\n");
+      const re      = useRe ? new RegExp(pattern) : null;
+      const hits    = lines
+        .map((l, i) => ({ l, i }))
+        .filter(({ l }) => re ? re.test(l) : l.includes(pattern))
+        .slice(0, 50)
+        .map(({ l, i }) => `L${i + 1}: ${l.trim().slice(0, 160)}`);
+      const text = hits.length
+        ? `**${hits.length} match(es)** in \`${abs}\`\n\`\`\`\n${hits.join("\n")}\n\`\`\``
+        : `*No matches for \`${pattern}\` in \`${abs}\`.*`;
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "read_file") {
+    const p     = String(args.path ?? "");
+    const limit = Number(args.lines ?? 300);
+    const abs   = path.isAbsolute(p) ? p : path.join(WORKSPACE, p);
+    try {
+      const stat = fs.statSync(abs);
+      if (stat.size > 200_000) return { content: [{ type: "text", text: `❌ File too large (${stat.size} bytes > 200 KB).` }] };
+      const lines = fs.readFileSync(abs, "utf-8").split("\n").slice(0, limit);
+      return { content: [{ type: "text", text: `\`\`\`\n${lines.join("\n")}\n\`\`\`` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "list_index") {
+    try {
+      const shards = fs.readdirSync(INDEX_DIR).filter(f => f.endsWith(".zoekt"));
+      if (!shards.length) return { content: [{ type: "text", text: `*Index empty — run index_directory first.*` }] };
+      return { content: [{ type: "text", text: `**${shards.length} shard(s)** in \`${INDEX_DIR}\`\n\`\`\`\n${shards.join("\n")}\n\`\`\`` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "purge_index") {
+    if (!args.confirm) return { content: [{ type: "text", text: "⚠️ Set confirm=true to purge." }] };
+    try {
+      const shards = fs.readdirSync(INDEX_DIR).filter(f => f.endsWith(".zoekt"));
+      for (const s of shards) fs.unlinkSync(path.join(INDEX_DIR, s));
+      return { content: [{ type: "text", text: `🗑️ Purged ${shards.length} shard(s) from \`${INDEX_DIR}\`.` }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "zoekt_status") {
+    try {
+      const resp = await axios.get(`${ZOEKT_BASE}/`, { timeout: 3000 });
+      const shards = fs.existsSync(INDEX_DIR)
+        ? fs.readdirSync(INDEX_DIR).filter(f => f.endsWith(".zoekt")).length
+        : 0;
+      return { content: [{ type: "text", text: [
+        `## Zoekt Status`,
+        `| Field | Value |`,
+        `|-------|-------|`,
+        `| Status      | ✅ Running |`,
+        `| Endpoint    | \`${ZOEKT_BASE}\` |`,
+        `| Index dir   | \`${INDEX_DIR}\` |`,
+        `| Shards      | ${shards} |`,
+        `| MCP version | v${VERSION} |`,
+      ].join("\n") }] };
+    } catch {
+      return { content: [{ type: "text", text: [
+        `## Zoekt Status`,
+        `| Field | Value |`,
+        `|-------|-------|`,
+        `| Status     | ⚠️ Not reachable |`,
+        `| Endpoint   | \`${ZOEKT_BASE}\` |`,
+        `| Index dir  | \`${INDEX_DIR}\` |`,
+        `| MCP version| v${VERSION} |`,
+        ``,
+        `Run: \`zoekt-webserver -index ${INDEX_DIR} -listen :${ZOEKT_PORT} &\``,
+      ].join("\n") }] };
+    }
+  }
+
+  // ── GitHub tools ──────────────────────────────────────────────────────────
+  if (name === "search_github_code") {
+    try {
+      const hits = await ghCodeSearch(
+        String(args.query ?? ""),
+        {
+          language: args.language ? String(args.language) : undefined,
+          scope:    (args.scope as GhSearchScope) ?? "user",
+          repos:    Array.isArray(args.repos) ? args.repos.map(String) : [],
+          limit:    Number(args.limit ?? 10),
+        },
+      );
+      const rlInfo = rateLimitStatus();
+      const text = [
+        `## 🐙 GitHub: \`${args.query}\``,
+        formatGhHits(hits, "GitHub"),
+        renderRateLimitBlock(rlInfo),
+      ].join("\n");
+      return { content: [{ type: "text", text }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ GitHub search error: ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "refresh_github_starred") {
+    try {
+      const cache = await starredCacheRefresh();
+      const byLang: Record<string, number> = {};
+      for (const r of cache.repos) {
+        const l = r.language ?? "Unknown";
+        byLang[l] = (byLang[l] ?? 0) + 1;
+      }
+      const top = Object.entries(byLang).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      const rows = top.map(([l, n]) => `| ${l} | ${n} |`).join("\n");
+      return { content: [{ type: "text", text: [
+        `## ✅ Starred Cache Refreshed`,
+        `**${cache.repos.length} repos** cached at \`${cache.fetchedAt}\``,
+        ``,
+        `### Top Languages`,
+        `| Language | Count |`,
+        `|----------|-------|`,
+        rows,
+      ].join("\n") }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ refresh_github_starred: ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "search_github_starred_code") {
+    try {
+      const result: StarredSearchResult = await searchStarredCode(
+        String(args.query ?? ""),
+        {
+          language:     args.language     ? String(args.language)     : undefined,
+          limitPerRepo: args.limitPerRepo ? Number(args.limitPerRepo) : undefined,
+          maxRepos:     args.maxRepos     ? Number(args.maxRepos)     : undefined,
+        },
+      );
+      const peek = peekStarredCache();
+      const sections: string[] = [
+        `## ⭐ Starred Search: \`${args.query}\``,
+        `*${result.reposSearched} repos searched | ${result.hits.length} hits | cache: ${result.fromCache ? "hit" : "miss"}*`,
+      ];
+      if (peek) {
+        sections.push(`*Starred cache: ${peek.count} repos as of ${peek.fetchedAt}*`);
+      }
+      sections.push("", formatGhHits(result.hits, "starred repos"));
+      if (result.partialError) {
+        sections.push(`\n> ⚠️ **Partial results:** ${result.partialError}`);
+      }
+      sections.push(renderRateLimitBlock(result.rateLimitInfo));
+      return { content: [{ type: "text", text: sections.join("\n") }] };
+    } catch (e) {
+      return { content: [{ type: "text", text: `❌ search_github_starred_code: ${(e as Error).message}` }] };
+    }
+  }
+
+  if (name === "search_everywhere") {
+    const query    = String(args.query ?? "");
+    const language = args.language ? String(args.language) : undefined;
+    const scope    = String(args.scope ?? "all");
+
+    const tasks: [string, Promise<string>][] = [];
+
+    if (scope === "local" || scope === "all") {
+      tasks.push(["local", zoektSearch(rewriteQuery(query))]);
+    }
+    if (scope === "github" || scope === "all") {
+      tasks.push(["github",
+        searchStarredCode(query, { language, limitPerRepo: 3, maxRepos: 40 })
+          .then((r: StarredSearchResult) => [
+            formatGhHits(r.hits, "starred repos"),
+            r.partialError ? `\n> ⚠️ ${r.partialError}` : "",
+            renderRateLimitBlock(r.rateLimitInfo),
+          ].join("\n"))
+          .catch((e: unknown) => `⚠️ GitHub search failed: ${(e as Error).message}`),
+      ]);
+    }
+
+    const settled = await Promise.allSettled(tasks.map(([, p]) => p));
+    const sections: string[] = [`## 🌐 search_everywhere: \`${query}\``];
+    for (let i = 0; i < tasks.length; i++) {
+      const [label]  = tasks[i];
+      const result   = settled[i];
+      const emoji    = label === "local" ? "🔍" : "🐙";
+      sections.push(`\n### ${emoji} ${label.charAt(0).toUpperCase() + label.slice(1)} Results`);
+      if (result.status === "fulfilled") {
+        sections.push(result.value);
+      } else {
+        sections.push(`⚠️ ${label} search error: ${result.reason}`);
+      }
+    }
+
+    const rlInfo = rateLimitStatus();
+    if (rlInfo) sections.push(renderRateLimitBlock(rlInfo));
+
+    return { content: [{ type: "text", text: sections.join("\n") }] };
+  }
+
+  return {
+    content: [{ type: "text", text: `❌ Unknown tool: ${name}` }],
+    isError: true,
+  };
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Start
+// ─────────────────────────────────────────────────────────────────────────────
 async function main() {
-  await server.connect(new StdioServerTransport());
-  process.stderr.write(`[das-codegrep-mcp] ready zoekt@${ZOEKT_BASE} index:${INDEX_DIR}\n`);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(
+    `[das-codegrep-mcp] v${VERSION} ready  zoekt@${ZOEKT_BASE}  index:${INDEX_DIR}\n`
+  );
 }
-main().catch(e=>{console.error(e);process.exit(1);});
+
+main().catch(err => {
+  process.stderr.write(`[das-codegrep-mcp] FATAL: ${err}\n`);
+  process.exit(1);
+});
