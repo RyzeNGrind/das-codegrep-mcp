@@ -14,11 +14,10 @@
   };
 
   outputs =
-    inputs@{
-      flake-parts,
-      systems,
-      agenix,
-      ...
+    inputs@{ flake-parts
+    , systems
+    , agenix
+    , ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = import systems;
