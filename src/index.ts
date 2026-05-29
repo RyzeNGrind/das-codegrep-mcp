@@ -27,23 +27,60 @@ const INDEX_DIR  = process.env.DAS_INDEX_DIR ?? `${process.env.HOME}/.local/shar
 const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
 const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
+// ---------------------------------------------------------------------------
+// Zoekt query rewriter
+// Zoekt REST API uses `language:` not `lang:`, and language names are Title-cased.
+// Also normalises common aliases so `lang:nix` → `language:Nix` etc.
+// ---------------------------------------------------------------------------
+const LANG_MAP: Record<string,string> = {
+  nix:"Nix", ts:"TypeScript", typescript:"TypeScript", js:"JavaScript",
+  javascript:"JavaScript", py:"Python", python:"Python", rs:"Rust", rust:"Rust",
+  sh:"Shell", bash:"Shell", shell:"Shell", go:"Go", c:"C", cpp:"C++",
+  java:"Java", rb:"Ruby", ruby:"Ruby", md:"Markdown", markdown:"Markdown",
+  json:"JSON", yaml:"YAML", toml:"TOML", html:"HTML", css:"CSS",
+};
+
+function rewriteQuery(q: string): string {
+  // Replace lang:xxx or language:xxx with language:NormalisedName
+  return q.replace(/\b(?:lang|language):(\S+)/gi, (_m, l) => {
+    const key = l.toLowerCase();
+    return `language:${LANG_MAP[key] ?? l}`;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Guard patterns — ordered most-severe first
+// ---------------------------------------------------------------------------
 interface GuardPattern {
   id: string; label: string; severity: "error" | "warn"; regex: RegExp; tip: string;
 }
 
 const GUARD: GuardPattern[] = [
+  // Secrets
   { id:"hardcoded-secret",  label:"Hardcoded secret/token",
     severity:"error", regex:/(api[_-]?key|secret|token|password)\s*=\s*["'][^"']{8,}["']/i,
     tip:"Use sops-nix, age, or environment variables." },
-  { id:"eval-usage", label:"eval() call",
-    severity:"error", regex:/\beval\s*\(/,
-    tip:"eval() is a code-injection vector. Refactor." },
+  // eval variants: eval(…), eval $(…), eval `…`
+  { id:"eval-usage", label:"eval() / eval $() / eval `` call",
+    severity:"error", regex:/\beval\s*(\(|\$\(|`)/,
+    tip:"eval is a code-injection vector. Refactor to avoid it." },
+  // curl/wget exec patterns: pipe to shell OR eval $(curl …) OR bash <(curl …)
+  { id:"curl-exec", label:"Remote code execution via curl/wget",
+    severity:"error",
+    regex:/curl[^|#\n]*\|\s*(ba)?sh|wget[^|#\n]*\|\s*(ba)?sh|eval\s+\$\(\s*(curl|wget)|bash\s+<\(\s*(curl|wget)/,
+    tip:"Verify checksums — never execute remote content directly." },
+  // rm -rf with no variable guard
   { id:"rm-rf", label:"rm -rf without guard",
     severity:"error", regex:/rm\s+-rf?\s+[^$\{]/,
     tip:"Add path validation or use safer deletion patterns." },
-  { id:"curl-pipe-sh", label:"curl|sh / wget|bash",
-    severity:"error", regex:/curl[^|]+\|\s*(ba)?sh|wget[^|]+\|\s*(ba)?sh/,
-    tip:"Verify checksums — never pipe curl/wget to shell." },
+  // Nix-specific
+  { id:"nix-fetchurl-nohash", label:"fetchurl/fetchTarball without hash",
+    severity:"error", regex:/fetch(url|Tarball)\s*\{[^}]*url[^}]*\}/,
+    tip:"Pin with sha256 for reproducibility." },
+  { id:"nix-with-pkgs", label:"with pkgs; anti-pattern",
+    severity:"warn", regex:/with\s+pkgs\s*;/,
+    tip:"Prefer explicit pkgs.foo over with pkgs;" },
+  // JS/TS
   { id:"console-log", label:"console.log in source",
     severity:"warn", regex:/console\.log\(/,
     tip:"Use a structured logger for production code." },
@@ -56,12 +93,6 @@ const GUARD: GuardPattern[] = [
   { id:"any-type", label:"TypeScript any type",
     severity:"warn", regex:/:\s*any\b/,
     tip:"Use specific types or unknown + type narrowing." },
-  { id:"nix-fetchurl-nohash", label:"fetchurl/fetchTarball without hash",
-    severity:"error", regex:/fetch(url|Tarball)\s*\{[^}]*url[^}]*\}/,
-    tip:"Pin with sha256 for reproducibility." },
-  { id:"nix-with-pkgs", label:"with pkgs; anti-pattern",
-    severity:"warn", regex:/with\s+pkgs\s*;/,
-    tip:"Prefer explicit pkgs.foo over with pkgs;" },
 ];
 
 interface GuardFinding {
@@ -95,9 +126,10 @@ interface ZoektResult {
 }
 
 async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
+  const rewritten = rewriteQuery(query);
   try {
     const r = await axios.get(`${ZOEKT_BASE}/search`,
-      {params:{q:query,num:max,format:"json"},timeout:5000});
+      {params:{q:rewritten,num:max,format:"json"},timeout:5000});
     return (r.data?.Result?.Files??[]).map((f:any)=>({
       repo:f.Repository??"",fileName:f.FileName??"",language:f.Language??"",score:f.Score??0,
       lines:(f.LineMatches??[]).map((l:any)=>({
@@ -121,7 +153,7 @@ const TOOLS: Tool[] = [
    description:"Index local directories with Zoekt. Run once per new repo/workspace.",
    inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}},required:["directories"]}},
   {name:"guard_code",
-   description:"Scan a snippet for bad patterns (secrets, eval, rm -rf, Nix anti-patterns) BEFORE writing to workspace.",
+   description:"Scan a snippet for bad patterns (secrets, eval, rm -rf, curl-exec, Nix anti-patterns) BEFORE writing to workspace.",
    inputSchema:{type:"object",properties:{code:{type:"string"},filename:{type:"string"}},required:["code"]}},
   {name:"guard_file",
    description:"Scan an existing local file for bad patterns (read-only).",
@@ -141,7 +173,7 @@ const TOOLS: Tool[] = [
 ];
 
 const server = new Server(
-  {name:"das-codegrep-mcp",version:"0.1.0"},
+  {name:"das-codegrep-mcp",version:"0.1.1"},
   {capabilities:{tools:{}}},
 );
 
@@ -153,8 +185,9 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
     switch(name) {
       case "search_code": {
         const {query,maxResults=15}=args as {query:string;maxResults?:number};
+        const rewritten = rewriteQuery(query);
         const rs=await zoektSearch(query,maxResults);
-        if(!rs.length) return {content:[{type:"text",text:`No results for \`${query}\`. Run index_directory first?`}]};
+        if(!rs.length) return {content:[{type:"text",text:`No results for \`${rewritten}\`. Run index_directory first or broaden query.`}]};
         const out=rs.map(r=>{
           const snips=r.lines.map(l=>[
             ...l.before.map((b,i)=>`  ${l.lineNumber-l.before.length+i} | ${b}`),
@@ -163,7 +196,7 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
           ].join("\n")).join("\n---\n");
           return `## ${r.fileName} (${r.language||"?"} score:${r.score.toFixed(2)})\n\`\`\`\n${snips}\n\`\`\``;
         }).join("\n\n");
-        return {content:[{type:"text",text:`# Trigram: \`${query}\`\n**${rs.length} file(s)**\n\n${out}`}]};
+        return {content:[{type:"text",text:`# Trigram: \`${rewritten}\`\n**${rs.length} file(s)**\n\n${out}`}]};
       }
       case "index_directory": {
         const {directories}=args as {directories:string[]};
@@ -174,23 +207,24 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
       case "guard_code": {
         const {code,filename="snippet"}=args as {code:string;filename?:string};
         const findings=guardCode(code,filename);
-        if(!findings.length) return {content:[{type:"text",text:`OK: guard pass - \`${filename}\` clean.`}]};
+        if(!findings.length) return {content:[{type:"text",text:`✅ Guard PASS — \`${filename}\` clean.`}]};
         const errors=findings.filter(f=>f.severity==="error");
         const warns=findings.filter(f=>f.severity==="warn");
-        const fmt=(f:GuardFinding)=>`**[${f.severity.toUpperCase()}]** \`${f.label}\` L${f.line}\n> \`${f.lineText}\`\n> ${f.tip}`;
+        const fmt=(f:GuardFinding)=>`**[${f.severity.toUpperCase()}]** \`${f.label}\` L${f.line}\n> \`${f.lineText}\`\n> 💡 ${f.tip}`;
+        const blocked = errors.length > 0;
         return {content:[{type:"text",text:[
-          `# Guard: \`${filename}\``,
-          errors.length?`## Errors\n${errors.map(fmt).join("\n\n")}"`:" ",
-          warns.length?`## Warnings\n${warns.map(fmt).join("\n\n")}`:" ",
-          `${errors.length} error(s) ${warns.length} warning(s)${errors.length>0?" — fix before commit.":""}`,
+          `# Guard: \`${filename}\` — ${blocked?"🚫 BLOCKED":"⚠️  WARNINGS"}`,
+          errors.length?`## Errors\n${errors.map(fmt).join("\n\n")}`:"",
+          warns.length?`## Warnings\n${warns.map(fmt).join("\n\n")}`:"",
+          `${errors.length} error(s) · ${warns.length} warning(s)${blocked?" — fix errors before writing to workspace.":""}`,
         ].filter(Boolean).join("\n\n")}]};
       }
       case "guard_file": {
         const {filePath}=args as {filePath:string};
         const code=fs.readFileSync(filePath,"utf8");
         const findings=guardCode(code,path.basename(filePath));
-        if(!findings.length) return {content:[{type:"text",text:`OK: guard pass - \`${filePath}\``}]};
-        const fmt=(f:GuardFinding)=>`- **[${f.severity.toUpperCase()}]** L${f.line}: \`${f.label}\`\n  ${f.tip}`;
+        if(!findings.length) return {content:[{type:"text",text:`✅ Guard PASS — \`${filePath}\``}]};
+        const fmt=(f:GuardFinding)=>`- **[${f.severity.toUpperCase()}]** L${f.line}: \`${f.label}\`\n  💡 ${f.tip}`;
         return {content:[{type:"text",text:`# Guard: ${filePath}\n\n${findings.map(fmt).join("\n\n")}`}]};
       }
       case "search_file": {
@@ -218,9 +252,9 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
       case "zoekt_status": {
         try {
           await axios.get(`${ZOEKT_BASE}/`,{timeout:2000});
-          return {content:[{type:"text",text:`OK: Zoekt running @ \`${ZOEKT_BASE}\`  index: \`${INDEX_DIR}\``}]};
+          return {content:[{type:"text",text:`✅ Zoekt running @ \`${ZOEKT_BASE}\`  index: \`${INDEX_DIR}\``}]};
         } catch {
-          return {content:[{type:"text",text:`FAIL: Zoekt not running. Run: ./bin/dev-up`}]};
+          return {content:[{type:"text",text:`❌ Zoekt not running. Run: ./bin/dev-up`}]};
         }
       }
       default: throw new Error(`Unknown tool: ${name}`);
