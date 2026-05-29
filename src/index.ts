@@ -28,24 +28,39 @@ const WORKSPACE  = process.env.DAS_WORKSPACE ?? process.env.HOME ?? "/tmp";
 const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
 // ---------------------------------------------------------------------------
-// Zoekt query rewriter
-// Zoekt REST API uses `language:` not `lang:`, and language names are Title-cased.
-// Also normalises common aliases so `lang:nix` → `language:Nix` etc.
+// Zoekt query normaliser
+// Zoekt native syntax: lang:Nix  (Title-cased, no "language:" prefix)
+// We accept lowercase aliases and normalise to Title-case lang:X
+// We also expand ext:nix -> f:\.nix$ as a convenience
 // ---------------------------------------------------------------------------
-const LANG_MAP: Record<string,string> = {
-  nix:"Nix", ts:"TypeScript", typescript:"TypeScript", js:"JavaScript",
-  javascript:"JavaScript", py:"Python", python:"Python", rs:"Rust", rust:"Rust",
-  sh:"Shell", bash:"Shell", shell:"Shell", go:"Go", c:"C", cpp:"C++",
-  java:"Java", rb:"Ruby", ruby:"Ruby", md:"Markdown", markdown:"Markdown",
-  json:"JSON", yaml:"YAML", toml:"TOML", html:"HTML", css:"CSS",
+const LANG_TITLES: Record<string,string> = {
+  nix:"Nix", ts:"TypeScript", typescript:"TypeScript",
+  js:"JavaScript", javascript:"JavaScript",
+  py:"Python", python:"Python",
+  rs:"Rust", rust:"Rust",
+  sh:"Shell", bash:"Shell", shell:"Shell",
+  go:"Go", c:"C", cpp:"C++",
+  java:"Java", rb:"Ruby", ruby:"Ruby",
+  md:"Markdown", markdown:"Markdown",
+  json:"JSON", yaml:"YAML", toml:"TOML",
+  html:"HTML", css:"CSS",
 };
 
 function rewriteQuery(q: string): string {
-  // Replace lang:xxx or language:xxx with language:NormalisedName
-  return q.replace(/\b(?:lang|language):(\S+)/gi, (_m, l) => {
+  // Normalise lang:xxx  (already correct Zoekt syntax, just fix case)
+  let out = q.replace(/\blang:(\S+)/gi, (_m, l) => {
     const key = l.toLowerCase();
-    return `language:${LANG_MAP[key] ?? l}`;
+    return `lang:${LANG_TITLES[key] ?? l}`;
   });
+  // Accept "language:xxx" as alias for "lang:xxx" (common user mistake)
+  out = out.replace(/\blanguage:(\S+)/gi, (_m, l) => {
+    const key = l.toLowerCase();
+    return `lang:${LANG_TITLES[key] ?? l}`;
+  });
+  // ext:nix  ->  f:\.nix$
+  out = out.replace(/\bext:(\S+)/gi, (_m, e) =>
+    `f:\\.${e.replace(/^\./, "")}$`);
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -56,31 +71,25 @@ interface GuardPattern {
 }
 
 const GUARD: GuardPattern[] = [
-  // Secrets
   { id:"hardcoded-secret",  label:"Hardcoded secret/token",
     severity:"error", regex:/(api[_-]?key|secret|token|password)\s*=\s*["'][^"']{8,}["']/i,
     tip:"Use sops-nix, age, or environment variables." },
-  // eval variants: eval(…), eval $(…), eval `…`
   { id:"eval-usage", label:"eval() / eval $() / eval `` call",
     severity:"error", regex:/\beval\s*(\(|\$\(|`)/,
     tip:"eval is a code-injection vector. Refactor to avoid it." },
-  // curl/wget exec patterns: pipe to shell OR eval $(curl …) OR bash <(curl …)
   { id:"curl-exec", label:"Remote code execution via curl/wget",
     severity:"error",
     regex:/curl[^|#\n]*\|\s*(ba)?sh|wget[^|#\n]*\|\s*(ba)?sh|eval\s+\$\(\s*(curl|wget)|bash\s+<\(\s*(curl|wget)/,
     tip:"Verify checksums — never execute remote content directly." },
-  // rm -rf with no variable guard
   { id:"rm-rf", label:"rm -rf without guard",
     severity:"error", regex:/rm\s+-rf?\s+[^$\{]/,
     tip:"Add path validation or use safer deletion patterns." },
-  // Nix-specific
   { id:"nix-fetchurl-nohash", label:"fetchurl/fetchTarball without hash",
     severity:"error", regex:/fetch(url|Tarball)\s*\{[^}]*url[^}]*\}/,
     tip:"Pin with sha256 for reproducibility." },
   { id:"nix-with-pkgs", label:"with pkgs; anti-pattern",
     severity:"warn", regex:/with\s+pkgs\s*;/,
     tip:"Prefer explicit pkgs.foo over with pkgs;" },
-  // JS/TS
   { id:"console-log", label:"console.log in source",
     severity:"warn", regex:/console\.log\(/,
     tip:"Use a structured logger for production code." },
@@ -111,12 +120,33 @@ function guardCode(code:string, filename="snippet"): GuardFinding[] {
   return findings;
 }
 
-function zoektIndex(dirs:string[]): Promise<{stderr:string}> {
-  return new Promise((res,rej) => {
-    const p = child_process.spawn("zoekt-index",["-index",INDEX_DIR,...dirs],{stdio:"pipe"});
-    let stderr="";
-    p.stderr.on("data",(d:Buffer)=>stderr+=d.toString());
-    p.on("close",c=>c===0?res({stderr}):rej(new Error(`zoekt-index exited ${c}: ${stderr}`)));
+// ---------------------------------------------------------------------------
+// Indexer — prefer zoekt-git-index for git repos (language detection via ctags)
+// ---------------------------------------------------------------------------
+function zoektIndex(dirs: string[]): Promise<{stderr:string}> {
+  return new Promise((res, rej) => {
+    // Split dirs into git repos vs plain dirs
+    const gitDirs   = dirs.filter(d => fs.existsSync(path.join(d, ".git")));
+    const plainDirs = dirs.filter(d => !fs.existsSync(path.join(d, ".git")));
+    const jobs: Promise<{stderr:string}>[] = [
+      ...gitDirs.map(d => runIndexer("zoekt-git-index", ["-index", INDEX_DIR, d])),
+      ...plainDirs.map(d => runIndexer("zoekt-index",     ["-index", INDEX_DIR, d])),
+    ];
+    if (!jobs.length) return res({stderr:""});
+    Promise.all(jobs)
+      .then(rs => res({stderr: rs.map(r=>r.stderr).join("")}))
+      .catch(rej);
+  });
+}
+
+function runIndexer(bin: string, args: string[]): Promise<{stderr:string}> {
+  return new Promise((res, rej) => {
+    const p = child_process.spawn(bin, args, {stdio:"pipe"});
+    let stderr = "";
+    p.stderr.on("data", (d:Buffer) => stderr += d.toString());
+    p.on("close", c => c === 0
+      ? res({stderr})
+      : rej(new Error(`${bin} exited ${c}: ${stderr}`)));
   });
 }
 
@@ -147,10 +177,10 @@ async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
 
 const TOOLS: Tool[] = [
   {name:"search_code",
-   description:"Trigram search across indexed local codebases via Zoekt. Supports lang:nix, f:*.nix, regex, boolean ops.",
+   description:"Trigram search across indexed local codebases via Zoekt. Supports lang:nix, f:*.nix, ext:nix, regex, boolean ops.",
    inputSchema:{type:"object",properties:{query:{type:"string"},maxResults:{type:"number",default:15}},required:["query"]}},
   {name:"index_directory",
-   description:"Index local directories with Zoekt. Run once per new repo/workspace.",
+   description:"Index local directories with Zoekt. Uses zoekt-git-index for git repos (better language detection), zoekt-index for plain dirs.",
    inputSchema:{type:"object",properties:{directories:{type:"array",items:{type:"string"}}},required:["directories"]}},
   {name:"guard_code",
    description:"Scan a snippet for bad patterns (secrets, eval, rm -rf, curl-exec, Nix anti-patterns) BEFORE writing to workspace.",
@@ -173,7 +203,7 @@ const TOOLS: Tool[] = [
 ];
 
 const server = new Server(
-  {name:"das-codegrep-mcp",version:"0.1.1"},
+  {name:"das-codegrep-mcp",version:"0.1.2"},
   {capabilities:{tools:{}}},
 );
 
@@ -187,7 +217,11 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
         const {query,maxResults=15}=args as {query:string;maxResults?:number};
         const rewritten = rewriteQuery(query);
         const rs=await zoektSearch(query,maxResults);
-        if(!rs.length) return {content:[{type:"text",text:`No results for \`${rewritten}\`. Run index_directory first or broaden query.`}]};
+        if(!rs.length) return {content:[{type:"text",text:[
+          `No results for \`${rewritten}\`.`,
+          `Try: 1) run index_directory first  2) drop lang: filter  3) broaden terms`,
+          `Query hint: lang:Nix mkIf  OR  f:\\.nix$ mkIf  OR  ext:nix mkIf`,
+        ].join("\n")}]};
         const out=rs.map(r=>{
           const snips=r.lines.map(l=>[
             ...l.before.map((b,i)=>`  ${l.lineNumber-l.before.length+i} | ${b}`),
@@ -202,7 +236,14 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
         const {directories}=args as {directories:string[]};
         fs.mkdirSync(INDEX_DIR,{recursive:true});
         const {stderr}=await zoektIndex(directories);
-        return {content:[{type:"text",text:`OK: indexed ${directories.length} dir(s) -> \`${INDEX_DIR}\`\n${stderr||""}`}]};
+        const gitCount = directories.filter(d=>fs.existsSync(path.join(d,".git"))).length;
+        const plainCount = directories.length - gitCount;
+        return {content:[{type:"text",text:[
+          `OK: indexed ${directories.length} dir(s) -> \`${INDEX_DIR}\``,
+          `  ${gitCount} git repo(s) via zoekt-git-index (language-aware)`,
+          `  ${plainCount} plain dir(s) via zoekt-index`,
+          stderr||"(no indexer output)",
+        ].join("\n")}]};
       }
       case "guard_code": {
         const {code,filename="snippet"}=args as {code:string;filename?:string};
@@ -246,8 +287,9 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
       case "list_index": {
         if(!fs.existsSync(INDEX_DIR))
           return {content:[{type:"text",text:`Index dir \`${INDEX_DIR}\` not found. Run index_directory.`}]};
-        const repos=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt")).map(f=>f.replace(/\.zoekt$/,""));
-        return {content:[{type:"text",text:`## Indexed (${repos.length})\n${repos.map(r=>`- \`${r}\``).join("\n")||"None."}`}]};
+        const shards=fs.readdirSync(INDEX_DIR).filter(f=>f.endsWith(".zoekt"));
+        const repos=[...new Set(shards.map(f=>f.replace(/_v\d+\.\d+\.zoekt$/,"")))];
+        return {content:[{type:"text",text:`## Indexed (${repos.length} repo(s), ${shards.length} shard(s))\n${repos.map(r=>`- \`${r}\``).join("\n")||"None."}`}]};
       }
       case "zoekt_status": {
         try {
