@@ -1,0 +1,7 @@
+# Force executable bit on all bin/ scripts — preserved across checkout/rebase/clone
+bin/* text eol=lf
+bin/build -text
+bin/dev-up -text
+bin/install-hooks -text
+bin/start -text
+bin/validate -text
