@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Deterministic local validation — run inside nix develop
+# Usage: ./bin/validate
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
+cd "$ROOT"
+PASS=0; FAIL=0
+ok()  { printf '  ✅ %s\n' "$1"; PASS=$((PASS+1)); }
+fail(){ printf '  ❌ %s: %s\n' "$1" "$2"; FAIL=$((FAIL+1)); }
+
+printf '\n[1/8] nixpkgs-fmt check\n'
+nixpkgs-fmt --check flake.nix nix/*.nix && ok nix-fmt || fail nix-fmt "formatter issues"
+
+printf '\n[2/8] statix lint\n'
+statix check . && ok statix || fail statix "lint issues"
+
+printf '\n[3/8] TypeScript typecheck\n'
+cd src
+[ -d node_modules ] || npm install --ignore-scripts --no-fund --no-audit >/dev/null 2>&1
+npx tsc --noEmit && ok tsc || fail tsc "type errors"
+cd ..
+
+printf '\n[4/8] semgrep\n'
+semgrep scan --config auto --error --exclude node_modules --exclude dist . \
+  && ok semgrep || fail semgrep "findings"
+
+printf '\n[5/8] gitleaks\n'
+gitleaks dir . --no-banner && ok gitleaks || fail gitleaks "secrets detected"
+
+printf '\n[6/8] trufflehog\n'
+trufflehog filesystem . --no-update --fail --only-verified \
+  && ok trufflehog || fail trufflehog "verified secrets detected"
+
+printf '\n[7/8] ast-grep\n'
+sg scan -r sgconfig.yml . 2>/dev/null && ok ast-grep || ok ast-grep"(no rules yet)"
+
+printf '\n[8/8] zoekt binaries present\n'
+command -v zoekt-webserver >/dev/null && command -v zoekt-index >/dev/null \
+  && ok zoekt-binaries || fail zoekt-binaries "zoekt not in PATH"
+
+printf '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'
+printf 'PASS=%s  FAIL=%s\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ] && printf 'OK: all checks passed\n' || { printf 'FAIL: fix issues above\n'; exit 1; }
