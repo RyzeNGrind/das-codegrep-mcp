@@ -29,9 +29,8 @@ const ZOEKT_BASE = `http://127.0.0.1:${ZOEKT_PORT}`;
 
 // ---------------------------------------------------------------------------
 // Zoekt query normaliser
-// Zoekt native syntax: lang:Nix  (Title-cased, no "language:" prefix)
-// We accept lowercase aliases and normalise to Title-case lang:X
-// We also expand ext:nix -> f:\.nix$ as a convenience
+// Zoekt native syntax: lang:Nix  (Title-cased)
+// Accepts lowercase aliases: lang:nix, language:nix, ext:nix
 // ---------------------------------------------------------------------------
 const LANG_TITLES: Record<string,string> = {
   nix:"Nix", ts:"TypeScript", typescript:"TypeScript",
@@ -47,17 +46,12 @@ const LANG_TITLES: Record<string,string> = {
 };
 
 function rewriteQuery(q: string): string {
-  // Normalise lang:xxx  (already correct Zoekt syntax, just fix case)
-  let out = q.replace(/\blang:(\S+)/gi, (_m, l) => {
+  // lang:xxx or language:xxx → lang:TitleCase
+  let out = q.replace(/\b(?:lang|language):(\S+)/gi, (_m, l) => {
     const key = l.toLowerCase();
     return `lang:${LANG_TITLES[key] ?? l}`;
   });
-  // Accept "language:xxx" as alias for "lang:xxx" (common user mistake)
-  out = out.replace(/\blanguage:(\S+)/gi, (_m, l) => {
-    const key = l.toLowerCase();
-    return `lang:${LANG_TITLES[key] ?? l}`;
-  });
-  // ext:nix  ->  f:\.nix$
+  // ext:nix → f:\.nix$
   out = out.replace(/\bext:(\S+)/gi, (_m, e) =>
     `f:\\.${e.replace(/^\./, "")}$`);
   return out;
@@ -124,19 +118,14 @@ function guardCode(code:string, filename="snippet"): GuardFinding[] {
 // Indexer — prefer zoekt-git-index for git repos (language detection via ctags)
 // ---------------------------------------------------------------------------
 function zoektIndex(dirs: string[]): Promise<{stderr:string}> {
-  return new Promise((res, rej) => {
-    // Split dirs into git repos vs plain dirs
-    const gitDirs   = dirs.filter(d => fs.existsSync(path.join(d, ".git")));
-    const plainDirs = dirs.filter(d => !fs.existsSync(path.join(d, ".git")));
-    const jobs: Promise<{stderr:string}>[] = [
-      ...gitDirs.map(d => runIndexer("zoekt-git-index", ["-index", INDEX_DIR, d])),
-      ...plainDirs.map(d => runIndexer("zoekt-index",     ["-index", INDEX_DIR, d])),
-    ];
-    if (!jobs.length) return res({stderr:""});
-    Promise.all(jobs)
-      .then(rs => res({stderr: rs.map(r=>r.stderr).join("")}))
-      .catch(rej);
-  });
+  const gitDirs   = dirs.filter(d => fs.existsSync(path.join(d, ".git")));
+  const plainDirs = dirs.filter(d => !fs.existsSync(path.join(d, ".git")));
+  const jobs: Promise<{stderr:string}>[] = [
+    ...gitDirs.map(d => runIndexer("zoekt-git-index", ["-index", INDEX_DIR, d])),
+    ...plainDirs.map(d => runIndexer("zoekt-index",     ["-index", INDEX_DIR, d])),
+  ];
+  if (!jobs.length) return Promise.resolve({stderr:""});
+  return Promise.all(jobs).then(rs => ({stderr: rs.map(r=>r.stderr).join("")}));
 }
 
 function runIndexer(bin: string, args: string[]): Promise<{stderr:string}> {
@@ -150,9 +139,15 @@ function runIndexer(bin: string, args: string[]): Promise<{stderr:string}> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Zoekt REST search
+// Actual response shape (zoekt-webserver /search?format=json):
+//   { result: { FileMatches: [ { FileName, Repo, Language, Matches: [
+//       { LineNum, Fragments: [{ Pre, Match, Post }] } ] } ] } }
+// ---------------------------------------------------------------------------
 interface ZoektResult {
-  repo:string; fileName:string; language:string; score:number;
-  lines:{lineNumber:number;line:string;before:string[];after:string[]}[];
+  repo:string; fileName:string; language:string;
+  matches:{lineNum:number; pre:string; match:string; post:string}[];
 }
 
 async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
@@ -160,14 +155,23 @@ async function zoektSearch(query:string, max=15): Promise<ZoektResult[]> {
   try {
     const r = await axios.get(`${ZOEKT_BASE}/search`,
       {params:{q:rewritten,num:max,format:"json"},timeout:5000});
-    return (r.data?.Result?.Files??[]).map((f:any)=>({
-      repo:f.Repository??"",fileName:f.FileName??"",language:f.Language??"",score:f.Score??0,
-      lines:(f.LineMatches??[]).map((l:any)=>({
-        lineNumber:l.LineNumber,
-        line:Buffer.from(l.Line,"base64").toString("utf8"),
-        before:(l.Before??[]).map((b:any)=>Buffer.from(b,"base64").toString("utf8")),
-        after:(l.After??[]).map((a:any)=>Buffer.from(a,"base64").toString("utf8")),
-      })),
+
+    // Zoekt returns lowercase "result" key at top level
+    const data = r.data?.result ?? r.data?.Result ?? {};
+    const files: any[] = data.FileMatches ?? data.Files ?? [];
+
+    return files.map((f:any) => ({
+      repo:     f.Repo     ?? f.Repository ?? "",
+      fileName: f.FileName ?? "",
+      language: f.Language ?? "",
+      matches:  (f.Matches ?? f.LineMatches ?? []).flatMap((m:any) =>
+        (m.Fragments ?? []).map((frag:any) => ({
+          lineNum: m.LineNum ?? m.LineNumber ?? 0,
+          pre:     frag.Pre   ?? "",
+          match:   frag.Match ?? "",
+          post:    frag.Post  ?? "",
+        }))
+      ),
     }));
   } catch(e:any) {
     if(e?.code==="ECONNREFUSED") throw new Error(`Zoekt not running on ${ZOEKT_PORT}. Run: ./bin/dev-up`);
@@ -203,7 +207,7 @@ const TOOLS: Tool[] = [
 ];
 
 const server = new Server(
-  {name:"das-codegrep-mcp",version:"0.1.2"},
+  {name:"das-codegrep-mcp",version:"0.1.3"},
   {capabilities:{tools:{}}},
 );
 
@@ -223,12 +227,10 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
           `Query hint: lang:Nix mkIf  OR  f:\\.nix$ mkIf  OR  ext:nix mkIf`,
         ].join("\n")}]};
         const out=rs.map(r=>{
-          const snips=r.lines.map(l=>[
-            ...l.before.map((b,i)=>`  ${l.lineNumber-l.before.length+i} | ${b}`),
-            `> ${l.lineNumber} | ${l.line}`,
-            ...l.after.map((a,i)=>`  ${l.lineNumber+1+i} | ${a}`),
-          ].join("\n")).join("\n---\n");
-          return `## ${r.fileName} (${r.language||"?"} score:${r.score.toFixed(2)})\n\`\`\`\n${snips}\n\`\`\``;
+          const lines = r.matches.map(m =>
+            `> L${m.lineNum} | ${m.pre}**${m.match}**${m.post}`
+          ).join("\n");
+          return `## ${r.fileName} (${r.language||"?"} · ${r.repo})\n${lines}`;
         }).join("\n\n");
         return {content:[{type:"text",text:`# Trigram: \`${rewritten}\`\n**${rs.length} file(s)**\n\n${out}`}]};
       }
@@ -255,8 +257,8 @@ server.setRequestHandler(CallToolRequestSchema, async(req)=>{
         const blocked = errors.length > 0;
         return {content:[{type:"text",text:[
           `# Guard: \`${filename}\` — ${blocked?"🚫 BLOCKED":"⚠️  WARNINGS"}`,
-          errors.length?`## Errors\n${errors.map(fmt).join("\n\n")}`:"",
-          warns.length?`## Warnings\n${warns.map(fmt).join("\n\n")}`:"",
+          errors.length?`## Errors\n${errors.map(fmt).join("\n\n")}` :"",
+          warns.length?`## Warnings\n${warns.map(fmt).join("\n\n")}` :"",
           `${errors.length} error(s) · ${warns.length} warning(s)${blocked?" — fix errors before writing to workspace.":""}`,
         ].filter(Boolean).join("\n\n")}]};
       }
